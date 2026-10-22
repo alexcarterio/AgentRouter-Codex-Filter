@@ -1,1 +1,2 @@
+# Preserve distributed bytes so checksums remain valid after clone on Windows.
 * -text

@@ -1,0 +1,12 @@
+**/.runtime/
+*.zip
+*.bak
+*.bak-*
+*.sqlite
+*.sqlite-*
+auth.json
+config.toml
+.env
+.env.*
+Thumbs.db
+.DS_Store
