@@ -177,7 +177,7 @@ test('HTTP filtering handles all compressed forms and preserves authorization, p
   const health = JSON.parse((await call(origin, ADMIN + '/health', {method: 'GET'})).body);
   assert.equal(health.stats.filteredRequests, 7);
   assert.equal(health.stats.removedReasoningItems, 7);
-  assert.equal(health.filterVersion, 8);
+  assert.equal(health.filterVersion, 9);
   assert.equal(health.stats.removedItemIds, 35);
   assert.equal(health.stats.upstreamHttpErrors, 5);
   assert.equal(health.stats.lastUpstreamStatus, 200);

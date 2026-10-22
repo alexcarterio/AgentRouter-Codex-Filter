@@ -258,7 +258,8 @@ function formatLog(row) {
   const code = row.errorCode || ({resource: 'different_azure', rateLimit: 'rate_limit', transport: 'stream_incomplete',
     availability: 'no_available_channel'})[row.kind] || row.code || 'other';
   const codeNote = ({different_azure: '历史记录属于另一个 Azure 资源', rate_limit: '上游临时限流',
-    stream_incomplete: '上游断流或等待超时', request_deadline: '请求总时间已耗尽',
+    stream_incomplete: '上游断流或等待超时', alb_bad_request: '上游 ALB 网关返回 HTML 400',
+    request_deadline: '请求总时间已耗尽',
     insufficient_quota: '上游配额不足', response_too_large: '暂存响应超过大小限制',
     ccswitch_unavailable: 'CC Switch 不可用或请求超时',
     upstream_failed_without_details: '上游报告 response.failed，但没有提供可用的错误详情',

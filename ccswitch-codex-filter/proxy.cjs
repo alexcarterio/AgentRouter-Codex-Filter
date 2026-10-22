@@ -5,7 +5,7 @@ const zlib = require('node:zlib');
 const {timingSafeEqual} = require('node:crypto');
 const {StringDecoder} = require('node:string_decoder');
 const SERVICE = 'ccswitch-codex-reasoning-filter-v1';
-const FILTER_VERSION = 8;
+const FILTER_VERSION = 9;
 const ADMIN = '/__codex_filter__';
 const LIMIT = 64 * 1024 * 1024;
 const ERROR_LIMIT = 64 * 1024;
@@ -129,6 +129,13 @@ function sendError(res, error) {
   if (res.headersSent) { res.destroy(); return; }
   res.writeHead(error.status || 502, {'content-type': 'application/json; charset=utf-8'});
   res.end(JSON.stringify({error: {type: 'invalid_request_error', code: error.code || 'local_filter_error', message: error.message}}));
+}
+
+function isAlbBadRequestPage(text) {
+  return typeof text === 'string' && /<html\b[^>]*>/i.test(text) && /<\/html>/i.test(text)
+    && /<title>\s*400\s+Bad\s+Request\s*<\/title>/i.test(text)
+    && /<h1>\s*400\s+Bad\s+Request\s*<\/h1>/i.test(text)
+    && /<center>\s*alb\s*<\/center>/i.test(text);
 }
 
 function retryErrorClass(value) {
@@ -317,14 +324,14 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
           res.end(errorBody);
         }
       };
-      const schedule = (kind, response) => {
+      const schedule = (kind, response, errorCode = errorLabel(kind)) => {
         if (!kind) return false;
         const kindRetries = retriesByKind[kind], maxKindRetries = RETRY_LIMITS[kind];
         const limitReached = retries >= MAX_RETRIES || kindRetries >= maxKindRetries;
         const delayMs = limitReached ? 0 : retryDelay(kind, kindRetries, response.headers);
         if (limitReached || !Number.isFinite(delayMs) || delayMs < 0 || Date.now() + delayMs >= deadlineAt) {
           stats[kind + 'RetryExhausted']++;
-          requestLog('retry-exhausted', {kind, errorCode: errorLabel(kind), retries, maxRetries: MAX_RETRIES,
+          requestLog('retry-exhausted', {kind, errorCode, retries, maxRetries: MAX_RETRIES,
             kindRetries, maxKindRetries, deadline: !limitReached});
           return false;
         }
@@ -332,14 +339,14 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         retriesByKind[kind]++;
         phase = 'backoff';
         retryKinds.add(kind);
-        requestLog('retry-scheduled', {kind, errorCode: errorLabel(kind), retry: retries, maxRetries: MAX_RETRIES,
+        requestLog('retry-scheduled', {kind, errorCode, retry: retries, maxRetries: MAX_RETRIES,
           kindRetry: retriesByKind[kind], maxKindRetries, delayMs});
         startHeartbeat();
         retryTimer = setTimeout(() => {
           if (stopped || res.destroyed) return;
           stats[kind + 'Retries']++;
           phase = 'upstream';
-          requestLog('retry-dispatched', {kind, errorCode: errorLabel(kind), retry: retries, maxRetries: MAX_RETRIES,
+          requestLog('retry-dispatched', {kind, errorCode, retry: retries, maxRetries: MAX_RETRIES,
             kindRetry: retriesByKind[kind], maxKindRetries});
           dispatch();
         }, delayMs);
@@ -531,15 +538,21 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
           const completed = () => {
             if (stopped || res.destroyed) return;
             const errorBody = Buffer.concat(chunks);
-            let value;
-            try { value = JSON.parse(decodeBody(errorBody, response.headers['content-encoding'], ERROR_LIMIT)); } catch {}
+            let value, decoded;
+            try { decoded = decodeBody(errorBody, response.headers['content-encoding'], ERROR_LIMIT).toString('utf8'); } catch {}
+            try { value = JSON.parse(decoded); } catch {}
+            // Only the known ALB HTML page is retried; generic HTTP 400 and
+            // explicit auth/quota/parameter errors keep their existing behavior.
+            const albBadRequest = response.statusCode === 400 && isAlbBadRequestPage(
+              value ? value.error?.code === 'cc_switch_upstream_error' ? value.error.message : '' : decoded);
             const detected = retryErrorClass(value);
-            const kind = (detected === 'resource' && response.statusCode === 400)
+            const kind = albBadRequest ? 'transport' : ((detected === 'resource' && response.statusCode === 400)
               || (detected === 'rateLimit' && [400, 429].includes(response.statusCode))
-              || (detected === 'availability' && response.statusCode === 503) ? detected : null;
+              || (detected === 'availability' && response.statusCode === 503) ? detected : null);
             const code = String(value?.error?.code || value?.error?.type || 'other').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
-            requestLog('http-error', {status: response.statusCode, kind: kind || 'other', errorCode: kind ? errorLabel(kind) : code});
-            if (schedule(kind, response)) { settled = true; discard(); return; }
+            const errorCode = albBadRequest ? 'alb_bad_request' : kind ? errorLabel(kind) : code;
+            requestLog('http-error', {status: response.statusCode, kind: kind || 'other', errorCode});
+            if (schedule(kind, response, errorCode)) { settled = true; discard(); return; }
             settled = true;
             finishError(response, errorBody);
           };

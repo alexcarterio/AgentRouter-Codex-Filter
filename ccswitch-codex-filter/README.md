@@ -21,7 +21,7 @@ running 为 true 仅表示后台服务运行，不代表当前窗口已接入。
 恢复旧会话时，应检查 filteredRequests、lastFilteredAt 是否随新请求变化，
 并检查 removedReasoningItems、removedItemIds 的增量；总数可能包含连通性测试，不能单凭总数判断当前窗口已接入。
 
-更新脚本后，需要先 stop 再 start，重新加载代码。当前暂存响应自动重试版 status 应显示 filterVersion: 8。双击桌面目录的“查看过滤状态.cmd”可持续查看带中文说明、按请求编号关联的实时日志；关闭这个日志窗口不会停止过滤服务。
+更新脚本后，需要先 stop 再 start，重新加载代码。当前暂存响应自动重试版 status 应显示 filterVersion: 9。双击桌面目录的“查看过滤状态.cmd”可持续查看带中文说明、按请求编号关联的实时日志；关闭这个日志窗口不会停止过滤服务。
 
 关闭过滤层：
 
@@ -43,7 +43,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\ccswitch-filter.ps1 Stop
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\ccswitch-filter.ps1 Test
 ~~~
 
-桌面目录的三个 .cmd 入口分别用于启动、停止、持续查看中文日志；查看状态不会停在一次性统计。三个入口可透传现有命令行选项，例如 --port、--config、--runtime；使用自定义参数时，启停和查看须保持一致。PowerShell 的 Status 返回一次性 JSON，Logs 持续输出日志，Test 同时运行过滤和重试两组本地测试。启动、停止不需要为 v8 更换命令；更新代码后先停止再启动，才能重新加载后台代码。
+桌面目录的三个 .cmd 入口分别用于启动、停止、持续查看中文日志；查看状态不会停在一次性统计。三个入口可透传现有命令行选项，例如 --port、--config、--runtime；使用自定义参数时，启停和查看须保持一致。PowerShell 的 Status 返回一次性 JSON，Logs 持续输出日志，Test 同时运行过滤和重试两组本地测试。启动、停止不需要为 v9 更换命令；更新代码后先停止再启动，才能重新加载后台代码。
 
 ## 实际过滤内容
 
@@ -54,8 +54,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\ccswitch-filter.ps1 Test
   仅移除可重新提交完整内容的记录 ID，保留工具配对所需的 call_id、消息 phase、工具参数与结果、嵌套文件/资源引用。
 - 保留当前请求的 reasoning.effort、普通消息、图片、工具调用、工具结果和 call_id。
 - 支持 JSON、gzip、deflate、br、zstd 请求；重新计算 Content-Length。
-- v8 沿用整轮 SSE 暂存，收到 response.completed 才交给客户端；失败尝试中的正文、推理及工具调用不会交给客户端。成功内容会更晚显示。保留成功响应的推理，下次请求继续过滤历史密文。
-- 自动重试明确的 Azure 历史 item 资源归属错误（HTTP 400）、临时 token/request 限流（HTTP 400/429，包含 rate_limit_exceeded 或 exceeded token rate limit）、断流/超时，以及“无可用渠道”（HTTP 503，包含 no_available_channel 或对应中英文消息）。预算、余额、配额耗尽不重试。
+- v9 沿用整轮 SSE 暂存，收到 response.completed 才交给客户端；失败尝试中的正文、推理及工具调用不会交给客户端。成功内容会更晚显示。保留成功响应的推理，下次请求继续过滤历史密文。
+- 自动重试明确的 Azure 历史 item 资源归属错误（HTTP 400）、临时 token/request 限流（HTTP 400/429，包含 rate_limit_exceeded 或 exceeded token rate limit）、断流/超时，以及“无可用渠道”（HTTP 503，包含 no_available_channel 或对应中英文消息）。带 alb 标记、title/h1 均为 400 Bad Request 的完整 HTML 网关错误页（HTTP 400，含 CC Switch 包装形式）按断流类重试，日志标记 alb_bad_request；与断流/超时共用 10 次额度。普通参数错误和其他 HTML 400 不重试。预算、余额、配额耗尽不重试。
   按错误分类限制额外重试：临时限流最多 20 次，断流/超时及无可用渠道各最多 10 次，Azure 资源归属错误最多 5 次；四类合计最多 20 次，即每条客户端请求最多转发 21 次。Azure 资源错误依次等 1、2、4、8、15 秒；限流依次等 10、20、40、60、60 秒并增加不足 1 秒随机延迟；无可用渠道依次等 5、10、20、30、60 秒。超过第 5 次后沿用最后一级间隔；各类独立计算退避阶梯，切换错误类型不重置合计额度。
   Retry-After、retry-after-ms、x-ms-retry-after-ms 是等待下限；不会为了缩短等待提前重试。CC Switch 自己的故障转移仍然生效，本层只重试其最终返回的目标错误。
   每次重发同一个过滤后的请求，不添加“继续”、不修改会话历史或搜索记录。重试恢复时客户端只收到成功尝试的完整响应。客户端工具不会执行被丢弃的失败尝试；上游内置搜索等仍可能再次运行并消耗上游配额。
@@ -103,9 +103,9 @@ node .\filter.cjs start --config "C:\path\to\config.toml" --runtime "C:\path\to\
 
 stats.removedItemIds 是清理的历史记录 ID 数量；stats.lastFilteredAt 是最后处理 Responses 请求的时间。
 stats.lastUpstreamStatus / upstreamHttpErrors 记录上游 HTTP 状态及 4xx/5xx 次数；HTTP 200 不等于完整成功，以 request-finished 的 SUCCESS 和 response.completed 为准。
-stats.resourceRetries / rateLimitRetries 是两类错误各自执行的额外重试数；resourceRetryAccepted / rateLimitRetryAccepted / transportRetryAccepted 是重试后接受成功响应的请求数（SSE 必须收到 response.completed）；resourceRetryExhausted / rateLimitRetryExhausted 是次数或期限耗尽数。streamRetryErrors 是丢弃暂存响应并重试的流内错误数；transportRetries 统计断流和超时重试。activeRequests 是当前转发或等待中的请求数。
+stats.resourceRetries / rateLimitRetries 是两类错误各自执行的额外重试数；resourceRetryAccepted / rateLimitRetryAccepted / transportRetryAccepted 是重试后接受成功响应的请求数（SSE 必须收到 response.completed）；resourceRetryExhausted / rateLimitRetryExhausted 是次数或期限耗尽数。streamRetryErrors 是丢弃暂存响应并重试的流内错误数；transportRetries 统计断流、超时和上述 ALB HTML 400 的重试。activeRequests 是当前转发或等待中的请求数。
 
-实时日志：START/FILTER 表示请求开始；FAIL 显示 different_azure、rate_limit、stream_incomplete、upstream_failed_without_details、no_available_channel 或其他错误，并说明是否命中可重试分类；WAIT/RETRY 显示第几次及等待秒数；PENDING 每 15 秒显示剩余总时间；SUCCESS/FAILED/CANCELED 表示最终结果；EXHAUSTED 表示次数或总时间耗尽。同一请求使用相同编号，重启服务后编号重新开始。各行保留英文标识并附中文说明。stats.availabilityRetries / availabilityRetryAccepted / availabilityRetryExhausted 分别统计无可用渠道的重试、恢复成功、次数或期限耗尽。
+实时日志：START/FILTER 表示请求开始；FAIL 显示 different_azure、rate_limit、stream_incomplete、alb_bad_request、upstream_failed_without_details、no_available_channel 或其他错误，并说明是否命中可重试分类；WAIT/RETRY 显示第几次及等待秒数；PENDING 每 15 秒显示剩余总时间；SUCCESS/FAILED/CANCELED 表示最终结果；EXHAUSTED 表示次数或总时间耗尽。同一请求使用相同编号，重启服务后编号重新开始。各行保留英文标识并附中文说明。stats.availabilityRetries / availabilityRetryAccepted / availabilityRetryExhausted 分别统计无可用渠道的重试、恢复成功、次数或期限耗尽。
 
 运行文件位于 .runtime/：filter.log 是日志，routes.json 是仅用于地址恢复的备份，service.json 是进程控制信息（包含本地停止令牌，请勿公开）。
 filter.log 是结构化原始记录，终端会将其中事件翻译为中文说明。运行期间每分钟清理超过 24 小时的记录；单文件最多 4 MiB，写入达到上限时立即保留最新完整记录，因此繁忙时可能不足 24 小时。日志不生成无限历史归档。

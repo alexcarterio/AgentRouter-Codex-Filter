@@ -1,6 +1,6 @@
 AgentRouter-Codex-Filter
 
-让你的 Agent 帮你部署的 Codex 本地过滤器。当前版本：**V8**。
+让你的 Agent 帮你部署的 Codex 本地过滤器。当前版本：**V9**。
 
 适用于 **Windows + Node.js 24+ + CC Switch + Codex Responses HTTP/SSE**。在 Codex 与 CC Switch 之间过滤部分历史状态，并对可恢复的上游错误进行有限重试，缓解通过 AgentRouter 等上游使用 Codex 时的历史资源归属错误、限流和断流。
 
@@ -26,7 +26,7 @@ Agent 入口：[AGENTS.md](AGENTS.md)。安装、本地路径与端口适配、�
 Codex → 本机过滤器（默认 127.0.0.1:18181）→ CC Switch → AgentRouter / 已配置上游
 
 - 清理历史 reasoning 项及可移除的普通历史 item ID，保留消息正文、图片、工具配对的 call_id 和本轮推理强度。
-- 对明确的资源归属错误、临时限流、断流/超时、无可用渠道，以及没有错误详情的 response.failed 进行有限重试。
+- 对明确的资源归属错误、临时限流、断流/超时、带 alb 标记的 HTML 400、无可用渠道，以及没有错误详情的 response.failed 进行有限重试。
 - 分类额度与总期限共同限制重试：合计最多额外 20 次，总期限 30 分钟。认证失败、配额耗尽等不会靠无限重试掩盖。
 - 整轮 SSE 暂存到 response.completed 后才交付客户端，失败尝试中的客户端工具调用不会下发。
 - 修改连接地址前保留恢复资料；停止服务时恢复过滤器改写的 CC Switch 地址。

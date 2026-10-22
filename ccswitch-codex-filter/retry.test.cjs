@@ -12,6 +12,91 @@ const azureError = JSON.stringify({error: {type: 'invalid_request_error', code: 
 const rateError = JSON.stringify({error: {code: 'rate_limit_exceeded', type: 'rate_limit_error',
   message: 'rate limit exceeded: Your requests to test-model for test-model in test-region have exceeded token rate limit'}});
 
+const albPage = '<html> <head><title>400 Bad Request</title></head> <body bgcolor="white">'
+  + '<center><h1>400 Bad Request</h1></center> <hr><center>alb</center> </body> </html>';
+const albError = JSON.stringify({error: {code: 'cc_switch_upstream_error', type: 'invalid_request_error',
+  message: 'CC Switch local proxy failed while handling Codex endpoint /responses. '
+    + 'upstream_status: HTTP 400; cause: ' + albPage}});
+
+test('ALB HTML 400 retries raw and CC Switch wrapped responses without client-visible errors', async t => {
+  for (const wrapped of [false, true]) {
+    await t.test(wrapped ? 'gzip CC Switch wrapper' : 'raw HTML', async t => {
+      const bodies = [], rows = [];
+      const {origin, health} = await fixture(t, async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        bodies.push(Buffer.concat(chunks));
+        if (bodies.length <= 2) {
+          const encoded = wrapped ? zlib.gzipSync(albError) : Buffer.from(albPage);
+          res.writeHead(400, {'content-type': wrapped ? 'application/json' : 'text/html',
+            ...(wrapped ? {'content-encoding': 'gzip'} : {})});
+          res.write(encoded.subarray(0, 13)); res.end(encoded.subarray(13));
+        } else {
+          res.writeHead(200, {'content-type': 'text/event-stream'});
+          res.end(sse('response.output_text.delta', {delta: 'alb_recovered'})
+            + sse('response.completed', {response: {output: []}}));
+        }
+      }, (event, data) => rows.push({event, ...data}));
+      const response = await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true,"input":"offline-only"}'});
+      const output = await response.text();
+      assert.equal(response.status, 200);
+      assert.match(output, /alb_recovered/);
+      assert.match(output, /response.completed/);
+      assert.doesNotMatch(output, /400 Bad Request|cc_switch_upstream_error|event: error/);
+      assert.equal(bodies.length, 3);
+      assert.ok(bodies.every(body => body.equals(bodies[0])));
+      assert.equal((await health()).stats.transportRetries, 2);
+      for (const event of ['http-error', 'retry-scheduled', 'retry-dispatched']) {
+        assert.equal(rows.filter(row => row.event === event && row.errorCode === 'alb_bad_request').length, 2);
+      }
+    });
+  }
+});
+
+test('ALB HTML 400 detection does not retry ordinary 400, other HTML, auth, or quota errors', async t => {
+  const replies = [
+    JSON.stringify({error: {type: 'invalid_request_error', message: 'invalid model'}}),
+    albPage.replace('<center>alb</center>', '<center>other-server</center>'),
+    albPage.replace('<title>400 Bad Request</title>', '<title>Invalid parameters</title>'),
+    JSON.stringify({error: {code: 'invalid_api_key', message: albPage}}),
+    JSON.stringify({error: {code: 'insufficient_quota', message: albPage}}),
+    JSON.stringify({error: {code: 'invalid_request_error', message: albPage}}),
+    JSON.stringify({error: {code: 'cc_switch_upstream_error', message: 'HTTP 400: invalid request'}})
+  ];
+  const calls = new Map();
+  const {origin} = await fixture(t, (req, res) => {
+    req.resume(); calls.set(req.url, (calls.get(req.url) || 0) + 1);
+    res.writeHead(400, {'content-type': 'application/json'});
+    res.end(replies[Number(new URL(req.url, 'http://localhost').searchParams.get('case'))]);
+  });
+  for (let index = 0; index < replies.length; index++) {
+    const route = '/responses?case=' + index;
+    await (await fetch(origin + route, {method: 'POST', body: '{}'})).text();
+    assert.equal(calls.get(route), 1, 'case ' + index + ' must not retry');
+  }
+});
+
+test('ALB HTML 400 shares the ten-retry transport budget and exposes the final error on exhaustion', async t => {
+  let attempts = 0;
+  const rows = [];
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(400, {'content-type': 'application/json'});
+    res.end(albError);
+  }, (event, data) => rows.push({event, ...data}));
+  const output = await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.equal(attempts, 11);
+  assert.equal((output.match(/event: error/g) || []).length, 1);
+  assert.match(output, /400 Bad Request/);
+  assert.doesNotMatch(output, /response.completed/);
+  const state = await health();
+  assert.equal(state.stats.transportRetries, 10);
+  assert.equal(state.stats.transportRetryExhausted, 1);
+  assert.equal(state.stats.activeRequests, 0);
+  assert.ok(rows.some(row => row.event === 'retry-exhausted' && row.errorCode === 'alb_bad_request'
+    && row.kind === 'transport' && row.kindRetries === 10));
+});
+
 test('response.failed without details retries invisibly; explicit business errors still fail once', async t => {
   let attempts = 0;
   const calls = {}, events = [];
@@ -521,7 +606,7 @@ test('extended SSE rate-limit recovery stays invisible beyond five retries', asy
   assert.doesNotMatch(text, /discard_|event: error|rate_limit|response.failed/);
   assert.equal(attempts, 9);
   const state = await health();
-  assert.equal(state.filterVersion, 8);
+  assert.equal(state.filterVersion, 9);
   assert.equal(state.retryPolicy.maxRetries, 20);
   assert.equal(state.stats.rateLimitRetries, 8);
   assert.equal(state.stats.rateLimitRetryAccepted, 1);
