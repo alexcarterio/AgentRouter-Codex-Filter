@@ -97,6 +97,96 @@ test('ALB HTML 400 shares the ten-retry transport budget and exposes the final e
     && row.kind === 'transport' && row.kindRetries === 10));
 });
 
+const disconnectedMessage = 'stream disconnected before completion: stream closed before response.completed';
+const disconnectedError = {code: 'cc_switch_upstream_error', type: 'invalid_request_error',
+  message: 'CC Switch local proxy failed: ' + disconnectedMessage};
+
+test('explicit disconnected errors retry HTTP wrappers and SSE failures without rejected output', async t => {
+  for (const variant of [400, 500, 502, 'error', 'response.failed']) {
+    await t.test(String(variant), async t => {
+      const bodies = [], rows = [];
+      const isHttp = typeof variant === 'number';
+      const {origin, health} = await fixture(t, async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        bodies.push(Buffer.concat(chunks));
+        if (bodies.length <= 2 && isHttp) {
+          const body = JSON.stringify({error: disconnectedError});
+          res.writeHead(variant, {'content-type': 'application/json',
+            ...(variant === 502 ? {'content-encoding': 'gzip'} : {})});
+          res.end(variant === 502 ? zlib.gzipSync(body) : body);
+        } else {
+          res.writeHead(200, {'content-type': 'text/event-stream'});
+          if (bodies.length <= 2) {
+            res.end(sse('response.output_item.done', {item: {type: 'function_call', name: 'must_not_execute'}})
+              + sse(variant, variant === 'error' ? disconnectedError : {response: {error: disconnectedError}}));
+          } else res.end(sse('response.output_text.delta', {delta: 'disconnect_recovered'})
+            + sse('response.completed', {response: {output: []}}));
+        }
+      }, (event, data) => rows.push({event, ...data}));
+      const response = await fetch(origin + '/responses', {method: 'POST',
+        body: '{"stream":true,"input":"offline-only"}'});
+      const output = await response.text();
+      assert.equal(response.status, 200);
+      assert.match(output, /disconnect_recovered/);
+      assert.match(output, /response.completed/);
+      assert.doesNotMatch(output, /stream disconnected|cc_switch_upstream_error|event: error|must_not_execute/);
+      assert.equal(bodies.length, 3);
+      assert.ok(bodies.every(body => body.equals(bodies[0])));
+      const stats = (await health()).stats;
+      assert.equal(stats.transportRetries, 2);
+      assert.equal(stats.transportRetryAccepted, 1);
+      assert.equal(stats.streamRetryErrors, isHttp ? 0 : 2);
+      assert.equal(rows.filter(row => row.event === 'retry-dispatched'
+        && row.kind === 'transport' && row.errorCode === 'stream_incomplete').length, 2);
+    });
+  }
+});
+
+test('HTTP disconnected errors share the ALB transport allowance and return the final error on exhaustion', async t => {
+  let attempts = 0;
+  const rows = [];
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(attempts === 1 ? 400 : 502, {'content-type': 'application/json'});
+    res.end(attempts === 1 ? albError : JSON.stringify({error: disconnectedError}));
+  }, (event, data) => rows.push({event, ...data}));
+  const output = await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.equal(attempts, 11);
+  assert.equal((output.match(/event: error/g) || []).length, 1);
+  assert.ok(output.includes(disconnectedMessage));
+  assert.doesNotMatch(output, /^event: response\.completed$/m);
+  const stats = (await health()).stats;
+  assert.equal(stats.transportRetries, 10);
+  assert.equal(stats.transportRetryExhausted, 1);
+  assert.equal(stats.activeRequests, 0);
+  assert.ok(rows.some(row => row.event === 'retry-exhausted' && row.kind === 'transport'
+    && row.errorCode === 'stream_incomplete' && row.kindRetries === 10));
+});
+
+test('HTTP auth, quota, and unrelated failures do not retry despite disconnected wording', async t => {
+  const replies = [
+    {code: 'invalid_api_key', message: disconnectedMessage},
+    {code: 'insufficient_quota', message: disconnectedMessage},
+    {code: 'cc_switch_upstream_error', message: 'Quota exceeded: ' + disconnectedMessage},
+    {code: 'invalid_request_error', message: 'Invalid model'},
+    {code: 'cc_switch_upstream_error', message: 'Internal server error'}
+  ];
+  const calls = new Map();
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); calls.set(req.url, (calls.get(req.url) || 0) + 1);
+    res.writeHead(502, {'content-type': 'application/json'});
+    res.end(JSON.stringify({error: replies[Number(new URL(req.url, 'http://localhost').searchParams.get('case'))]}));
+  });
+  for (let index = 0; index < replies.length; index++) {
+    const route = '/responses?case=' + index;
+    const output = await (await fetch(origin + route, {method: 'POST', body: '{}'})).text();
+    assert.ok(output.includes(replies[index].message));
+    assert.equal(calls.get(route), 1);
+  }
+  assert.equal((await health()).stats.transportRetries, 0);
+});
+
 test('response.failed without details retries invisibly; explicit business errors still fail once', async t => {
   let attempts = 0;
   const calls = {}, events = [];
@@ -606,7 +696,7 @@ test('extended SSE rate-limit recovery stays invisible beyond five retries', asy
   assert.doesNotMatch(text, /discard_|event: error|rate_limit|response.failed/);
   assert.equal(attempts, 9);
   const state = await health();
-  assert.equal(state.filterVersion, 9);
+  assert.equal(state.filterVersion, 10);
   assert.equal(state.retryPolicy.maxRetries, 20);
   assert.equal(state.stats.rateLimitRetries, 8);
   assert.equal(state.stats.rateLimitRetryAccepted, 1);

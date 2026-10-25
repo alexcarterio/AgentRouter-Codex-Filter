@@ -22,7 +22,7 @@
 2. 修改已有配置或入口脚本前，建立本机回滚副本并核对内容/哈希。不要把本机回滚副本加入分享包，也不要使用别人电脑的运行目录或配置备份。
 3. 在 CC Switch 开启本地代理与 Codex 接管，使用接收者已经配置且选择的服务商。服务会只读发现当前用户 .cc-switch/cc-switch.db 中的端口；发现不到时回落到 15721，这不代表本机一定在用该端口，须核对实际监听。
 4. 过滤层仅接管顶层 model_provider 对应 [model_providers.NAME] 中的常规单行 base_url，并要求该地址与 CC Switch 入口匹配。没有支持的 provider 时会待命；不得为了让状态变绿而擅自把用户从官方默认账号切到一个自创服务商。若用户尚未决定或未配置 CC Switch 服务商，说明阻塞点，让用户完成必要选择或鉴权。
-5. 先查看状态并检查端口占用，避免多个实例管理同一份配置。现有服务不明时先识别归属，不直接结束未知进程。filterVersion 应为 9，retryPolicy 应列出合计 20 次、分类额度及 1800000 毫秒总期限；已运行旧版本时需要停止并重启才加载新代码。
+5. 先查看状态并检查端口占用，避免多个实例管理同一份配置。现有服务不明时先识别归属，不直接结束未知进程。filterVersion 应为 10，retryPolicy 应列出合计 20 次、分类额度及 1800000 毫秒总期限；已运行旧版本时需要停止并重启才加载新代码。
 
 默认情况无需改源码或脚本。如果配置、端口或数据库位于非默认位置，优先使用现有参数：--port、--config、--runtime、--upstream、--cc-db。选定参数在 start/status/logs/stop 时保持一致；变更配置路径或端口前先按原参数停止。
 
@@ -58,7 +58,7 @@ pwsh -NoProfile -File .\ccswitch-filter.ps1 Test
 
 随后通过用户将来实际使用的“启动过滤服务.cmd”启动，使用“查看过滤状态.cmd”观察状态和实时日志。验证以下不同层次，分别报告结果：
 
-- 进程启动：running=true、filterVersion=9。
+- 进程启动：running=true、filterVersion=10。
 - 本机接入：state=filtering 且 ccSwitchReachable=true；核对目标文件中的 base_url 指向选定过滤端口。仅 running=true 不表示接入完成。
 - 客户端流量：配置接入后，需要完全退出并重开对应 Codex 客户端。不要擅自结束用户当前任务或应用；如本会话依赖该客户端，先报告本机安装结果，让用户在合适时机重启。
 - 重启后，在接收者正常获授权的请求中观察 filteredRequests、lastFilteredAt 及请求日志变化。累计数可能由其他客户端产生，不单独作为当前会话证据。没有这一步只能报告“本机安装已验证，当前客户端实际经过过滤尚未验证”。
@@ -79,7 +79,7 @@ live-check.cjs 是可选真实模型探针，会使用本机账户、可能计�
 | config-error 或 address backup belongs to another config/port/version | 读脱敏 lastError，按原路径/端口/runtime 正常停止恢复，再变更参数；不直接删 routes.json 绕过保护。 |
 | 端口占用/启动失败 | 核对归属、旧实例版本和 runtime；停止已确认的本过滤实例或选择空闲端口，并同步三个入口。 |
 | filtering 但当前会话没有新记录 | 核对该会话实际 model_provider 和请求地址。openai/官方连接可能独立于 config.toml 中的 custom 提供商；CC Switch 用量中 data_source=codex_session 的“会话日志”是导入统计，不证明请求经过代理。按客户端实际连接设置处理，不因其他会话的日志变化宣称本会话已接入。 |
-| 长时间没有正文但日志在等待 | v9 暂存整轮 SSE 到 response.completed；重试与总期限会延后显示。结合日志中的请求编号、WAIT/RETRY/PENDING 判断，不凭首字延迟断言卡死。 |
+| 长时间没有正文但日志在等待 | v10 暂存整轮 SSE 到 response.completed；重试与总期限会延后显示。结合日志中的请求编号、WAIT/RETRY/PENDING 判断，不凭首字延迟断言卡死。 |
 | FAILED/EXHAUSTED、鉴权或余额错误 | 根据最终错误处理服务商状态、账号或额度。持续错误会返回客户端，过滤器不保证修复；不自动增加重试上限或切换账户。 |
 | compaction/上下文引用被拒绝 | 让用户先形成文字任务摘要，再新建会话续接；不静默删除用户上下文来强行转发。 |
 | 强制退出/重启电脑后连接失败 | 服务没有安装开机启动项；用相同参数重新 start，或 stop 离线恢复地址。保留原 .runtime/routes.json。 |

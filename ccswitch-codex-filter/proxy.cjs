@@ -5,7 +5,7 @@ const zlib = require('node:zlib');
 const {timingSafeEqual} = require('node:crypto');
 const {StringDecoder} = require('node:string_decoder');
 const SERVICE = 'ccswitch-codex-reasoning-filter-v1';
-const FILTER_VERSION = 9;
+const FILTER_VERSION = 10;
 const ADMIN = '/__codex_filter__';
 const LIMIT = 64 * 1024 * 1024;
 const ERROR_LIMIT = 64 * 1024;
@@ -548,6 +548,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             const detected = retryErrorClass(value);
             const kind = albBadRequest ? 'transport' : ((detected === 'resource' && response.statusCode === 400)
               || (detected === 'rateLimit' && [400, 429].includes(response.statusCode))
+              || detected === 'transport'
               || (detected === 'availability' && response.statusCode === 503) ? detected : null);
             const code = String(value?.error?.code || value?.error?.type || 'other').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
             const errorCode = albBadRequest ? 'alb_bad_request' : kind ? errorLabel(kind) : code;

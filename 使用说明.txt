@@ -1,10 +1,17 @@
 AgentRouter-Codex-Filter
 
-让你的 Agent 帮你部署的 Codex 本地过滤器。当前版本：**V9**。
+让你的 Agent 帮你部署的 Codex 本地过滤器。当前版本：**V10**。
 
 适用于 **Windows + Node.js 24+ + CC Switch + Codex Responses HTTP/SSE**。在 Codex 与 CC Switch 之间过滤部分历史状态，并对可恢复的上游错误进行有限重试，缓解通过 AgentRouter 等上游使用 Codex 时的历史资源归属错误、限流和断流。
 
 无需 npm install，不附带模型账号、密钥或个人运行资料。
+
+V10 更新说明
+
+- 修复 stream disconnected before completion: stream closed before response.completed 被包装为 HTTP JSON 错误时未进入断流重试的问题；覆盖 HTTP 400/500、gzip 502 和 SSE 错误场景。
+- 与其他断流/超时及指定 ALB 400 错误共用最多 10 次额外重试；所有类别合计最多 20 次，总期限 30 分钟。
+- 鉴权、余额和配额耗尽错误仍不重试；重试耗尽后返回最终错误，失败尝试中的正文和客户端工具调用不会下发。
+- 验证：48 项本机模拟测试通过，未调用真实模型。升级后先停止再启动服务，确认 filterVersion=10；当前客户端是否接入仍须按安装指南核对。
 
 直接交给你的 Agent
 
