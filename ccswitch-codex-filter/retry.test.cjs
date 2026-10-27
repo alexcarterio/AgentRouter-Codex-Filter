@@ -164,27 +164,88 @@ test('HTTP disconnected errors share the ALB transport allowance and return the 
     && row.errorCode === 'stream_incomplete' && row.kindRetries === 10));
 });
 
-test('HTTP auth, quota, and unrelated failures do not retry despite disconnected wording', async t => {
+test('HTTP auth, quota, and ordinary 4xx failures do not retry despite disconnected wording', async t => {
   const replies = [
-    {code: 'invalid_api_key', message: disconnectedMessage},
-    {code: 'insufficient_quota', message: disconnectedMessage},
-    {code: 'cc_switch_upstream_error', message: 'Quota exceeded: ' + disconnectedMessage},
-    {code: 'invalid_request_error', message: 'Invalid model'},
-    {code: 'cc_switch_upstream_error', message: 'Internal server error'}
+    {status: 502, error: {code: 'invalid_api_key', message: disconnectedMessage}},
+    {status: 502, error: {code: 'insufficient_quota', message: disconnectedMessage}},
+    {status: 502, error: {code: 'cc_switch_upstream_error', message: 'Quota exceeded: ' + disconnectedMessage}},
+    {status: 400, error: {code: 'invalid_request_error', message: 'Invalid model'}},
+    {status: 403, error: {code: 'forbidden', message: disconnectedMessage}}
   ];
   const calls = new Map();
   const {origin, health} = await fixture(t, (req, res) => {
     req.resume(); calls.set(req.url, (calls.get(req.url) || 0) + 1);
-    res.writeHead(502, {'content-type': 'application/json'});
-    res.end(JSON.stringify({error: replies[Number(new URL(req.url, 'http://localhost').searchParams.get('case'))]}));
+    const reply = replies[Number(new URL(req.url, 'http://localhost').searchParams.get('case'))];
+    res.writeHead(reply.status, {'content-type': 'application/json'});
+    res.end(JSON.stringify(reply));
   });
   for (let index = 0; index < replies.length; index++) {
     const route = '/responses?case=' + index;
     const output = await (await fetch(origin + route, {method: 'POST', body: '{}'})).text();
-    assert.ok(output.includes(replies[index].message));
-    assert.equal(calls.get(route), 1);
+    assert.ok(output.includes(replies[index].error.message));
+    assert.equal(calls.get(route), 1, 'case ' + index + ' must not retry');
   }
   assert.equal((await health()).stats.transportRetries, 0);
+});
+
+test('generic relay 5xx bodies retry as transport failures and recover', async t => {
+  let attempts = 0;
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); attempts++;
+    if (attempts === 1) {
+      res.writeHead(502, {'content-type': 'application/json'});
+      res.end(JSON.stringify({error: {code: 'cc_switch_upstream_error', message: 'Internal server error'}}));
+    } else {
+      res.writeHead(200, {'content-type': 'text/event-stream'});
+      res.end(sse('response.completed', {response: {output: []}}));
+    }
+  });
+  const text = await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.match(text, /response\.completed/);
+  assert.equal(attempts, 2);
+  assert.equal((await health()).stats.transportRetries, 1);
+});
+
+test('CC Switch forward failures retry as transport failures without client-visible errors', async t => {
+  let attempts = 0;
+  const rows = [];
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); attempts++;
+    if (attempts === 1) {
+      res.writeHead(502, {'content-type': 'application/json'});
+      res.end(JSON.stringify({error: {code: 'cc_switch_forward_failed',
+        message: 'forward to upstream failed: connect ECONNRESET'}}));
+    } else {
+      res.writeHead(200, {'content-type': 'text/event-stream'});
+      res.end(sse('response.output_text.delta', {delta: 'forward_recovered'})
+        + sse('response.completed', {response: {output: []}}));
+    }
+  }, (event, data) => rows.push({event, ...data}));
+  const output = await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.match(output, /forward_recovered/);
+  assert.doesNotMatch(output, /event: error|cc_switch_forward_failed/);
+  assert.equal(attempts, 2);
+  assert.equal((await health()).stats.transportRetries, 1);
+  assert.ok(rows.some(row => row.event === 'http-error' && row.kind === 'transport'
+    && row.errorCode === 'stream_incomplete'));
+});
+
+test('bad_response stream errors are retried before any content reaches the client', async t => {
+  let attempts = 0;
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.end(attempts === 1
+      ? sse('response.created', {response: {id: 'bad', output: []}})
+        + sse('error', {code: 'bad_response', message: 'malformed upstream payload'})
+      : sse('response.output_text.delta', {delta: 'clean_run'})
+        + sse('response.completed', {response: {output: []}}));
+  });
+  const text = await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.match(text, /clean_run/);
+  assert.doesNotMatch(text, /bad_response|event: error/);
+  assert.equal(attempts, 2);
+  assert.equal((await health()).stats.transportRetries, 1);
 });
 
 test('response.failed without details retries invisibly; explicit business errors still fail once', async t => {
@@ -247,7 +308,7 @@ async function fixture(t, handler, log = () => {}, options = {}) {
   return {origin, health: async () => (await fetch(origin + ADMIN + '/health')).json()};
 }
 
-test('resource rejection retries invisibly with identical history; output waits for completion', {timeout: 10000}, async t => {
+test('cross-resource rejection degrades lazy history once, then retries invisibly and streams immediately', {timeout: 10000}, async t => {
   const received = [];
   let finish;
   const gate = new Promise(resolve => { finish = resolve; });
@@ -267,8 +328,9 @@ test('resource rejection retries invisibly with identical history; output waits 
     await gate;
     res.end('event: response.completed\ndata: {"done":true}\n\n');
   });
-  const history = {model: 'offline-only', stream: true, reasoning: {effort: 'xhigh'}, input: [
-    {type: 'reasoning', id: 'rs_remove', encrypted_content: 'fixture'},
+  const history = {model: 'offline-only', store: false, stream: true, reasoning: {effort: 'xhigh'},
+    include: ['reasoning.encrypted_content'], input: [
+    {type: 'reasoning', id: 'rs_keep', encrypted_content: 'fixture', summary: []},
     {type: 'message', id: 'msg_remove', role: 'user', content: 'continue'},
     {type: 'function_call', id: 'fc_remove', name: 'lookup', call_id: 'call_keep', arguments: '{}'},
     {type: 'function_call_output', call_id: 'call_keep', output: 'done'},
@@ -279,28 +341,50 @@ test('resource rejection retries invisibly with identical history; output waits 
   }, body: JSON.stringify(history)});
   assert.equal(response.status, 200);
   const reader = response.body.getReader();
-  const first = await reader.read();
-  assert.match(Buffer.from(first.value).toString(), /response.in_progress/);
-  assert.doesNotMatch(Buffer.from(first.value).toString(), /recovered/);
+  // Heartbeats from the backoff window may arrive first; content still streams
+  // as soon as the upstream produces it, long before the gate is released.
+  let streamed = '';
+  const streamingDeadline = Date.now() + 3000;
+  while (Date.now() < streamingDeadline && !streamed.includes('recovered')) {
+    const part = await reader.read();
+    if (part.done) break;
+    streamed += Buffer.from(part.value).toString();
+  }
+  assert.match(streamed, /recovered/);
+  assert.doesNotMatch(streamed, /response\.completed/);
   finish();
   let tail = '';
   for (;;) { const part = await reader.read(); if (part.done) break; tail += Buffer.from(part.value); }
-  assert.match(tail, /response.completed/);
-  assert.match(tail, /recovered/);
+  assert.match(tail, /response\.completed/);
   assert.equal(received.length, 3);
-  for (const attempt of received) {
-    assert.deepEqual(attempt.body, received[0].body);
+  // The first attempt keeps reasoning continuity and codex's own history intact.
+  const lazyBody = JSON.parse(received[0].body);
+  assert.equal(lazyBody.store, false);
+  assert.deepEqual(lazyBody.include, ['reasoning.encrypted_content']);
+  assert.equal(lazyBody.input[0].type, 'reasoning');
+  assert.equal(lazyBody.input[0].encrypted_content, 'fixture');
+  assert.equal(lazyBody.input[1].id, 'msg_remove');
+  assert.equal(lazyBody.input[4].id, 'ws_keep_history');
+  assert.equal(lazyBody.reasoning.effort, 'xhigh');
+  assert.equal(lazyBody.input[2].call_id, lazyBody.input[3].call_id);
+  // After the cross-resource error the degraded attempts use the v10 stripped body.
+  for (const attempt of received.slice(1)) {
+    assert.deepEqual(attempt.body, received[1].body);
     assert.equal(attempt.headers.authorization, 'Bearer test-only');
     assert.equal(attempt.headers['x-session-id'], 'same-session');
     assert.equal(attempt.path, '/responses?session=original');
   }
-  const clean = JSON.parse(received[0].body);
-  assert.equal(clean.input.at(-1).id, 'ws_keep_history');
-  assert.equal(clean.reasoning.effort, 'xhigh');
-  assert.equal(clean.input[1].call_id, clean.input[2].call_id);
+  const stripped = JSON.parse(received[1].body);
+  assert.equal(stripped.input.some(item => item.type === 'reasoning'), false);
+  assert.equal(stripped.input[0].id, undefined);
+  assert.equal(stripped.input.at(-1).id, 'ws_keep_history');
+  assert.deepEqual(stripped.include, []);
+  assert.equal(stripped.input[1].call_id, stripped.input[2].call_id);
   const state = await health();
   assert.equal(state.stats.resourceRetries, 2);
   assert.equal(state.stats.resourceRetryAccepted, 1);
+  assert.equal(state.stats.reasoningKept, 1);
+  assert.equal(state.stats.removedReasoningItems, 1);
   assert.equal(state.stats.activeRequests, 0);
 });
 
@@ -330,17 +414,34 @@ test('unrelated failures are forwarded once; buffered target error is retried', 
       ? JSON.stringify({error: {type: 'other_error', message: JSON.parse(azureError).error.message}})
       : status === 400 ? '{"error":{"type":"invalid_request_error","message":"invalid model"}}' : azureError;
     res.writeHead(status, {'content-type': status === 200 ? 'text/event-stream' : 'application/json'});
-    res.end(status === 200 ? 'event: response.output_text.delta\ndata: {"delta":"committed"}\n\n'
-      + 'event: error\ndata: ' + body + '\n\n' : body);
+    res.end(status === 200 ? 'event: error\ndata: ' + body + '\n\n' : body);
   });
-  for (const route of ['/responses?status=400', '/responses?status=400&quote=1',
-    '/responses?status=402', '/responses?status=503', '/responses?status=200']) {
+  for (const route of ['/responses?status=400', '/responses?status=400&quote=1', '/responses?status=402',
+    '/responses?status=200']) {
     const response = await fetch(origin + route, {method: 'POST', body: route.includes('status=200') ? '{"stream":true}' : '{}'});
     assert.equal(response.status, Number(new URL(route, origin).searchParams.get('status')));
     assert.ok(await response.text());
     assert.equal(counts.get(route), route.includes('status=200') ? 6 : 1);
   }
   assert.equal((await health()).stats.resourceRetries, 5);
+});
+
+test('errors arriving with delivered content are not replayed and pass through once', async t => {
+  const counts = new Map();
+  const {origin, health} = await fixture(t, (req, res) => {
+    req.resume(); counts.set(req.url, (counts.get(req.url) || 0) + 1);
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.end('event: response.output_text.delta\ndata: {"delta":"committed"}\n\n'
+      + 'event: error\ndata: ' + JSON.stringify({error: {type: 'other_error',
+        message: JSON.parse(azureError).error.message}}) + '\n\n');
+  });
+  const response = await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'});
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.match(text, /committed/);
+  assert.match(text, /event: error/);
+  assert.equal(counts.get('/responses'), 1);
+  assert.equal((await health()).stats.resourceRetries, 0);
 });
 
 test('canceling during the backoff cancels the scheduled retry', {timeout: 5000}, async t => {
@@ -475,26 +576,23 @@ test('gzip fragmented SSE resource/rate rejections are intercepted before any mo
   assert.equal(state.stats.rateLimitRetries, 1);
 });
 
-test('buffered text and client tools from failed attempts are discarded before retry', async t => {
+test('errors before the first content event are retried; tool output from failed attempts is discarded', async t => {
   const counts = new Map();
   const {origin, health} = await fixture(t, (req, res) => {
     req.resume(); counts.set(req.url, (counts.get(req.url) || 0) + 1);
     res.writeHead(200, {'content-type': 'text/event-stream'});
-    const output = req.url.includes('tool')
-      ? sse('response.output_item.added', {item: {type: 'function_call', call_id: 'keep'}})
-      : sse('response.output_text.delta', {delta: 'already visible'});
-    res.end(sse('response.created', {response: {output: []}}) + output
+    // A tool item without any delta still belongs to the retryable window.
+    res.end(sse('response.created', {response: {output: []}})
+      + sse('response.output_item.added', {item: {type: 'function_call', call_id: 'keep'}})
       + (counts.get(req.url) === 1 ? sse('error', JSON.parse(rateError).error)
         : sse('response.completed', {response: {output: []}})));
   });
-  for (const route of ['/responses?text=1', '/responses?tool=1']) {
-    const response = await fetch(origin + route, {method: 'POST', body: '{"stream":true}'});
-    const text = await response.text();
-    assert.doesNotMatch(text, /rate limit exceeded/);
-    assert.equal(counts.get(route), 2);
-    assert.equal((text.match(/event: response.output_/g) || []).length, 1);
-  }
-  assert.equal((await health()).stats.rateLimitRetries, 2);
+  const response = await fetch(origin + '/responses?tool=1', {method: 'POST', body: '{"stream":true}'});
+  const text = await response.text();
+  assert.doesNotMatch(text, /rate limit exceeded/);
+  assert.equal(counts.get('/responses?tool=1'), 2);
+  assert.equal((text.match(/event: response.output_/g) || []).length, 1);
+  assert.equal((await health()).stats.rateLimitRetries, 1);
 });
 
 test('quota errors are not retried and streaming exhaustion returns a terminal error', async t => {
@@ -662,10 +760,13 @@ test('persistent unavailable channel exhausts ten retries; quota, auth, and unre
     res.end(JSON.stringify({error: {code: quota ? 'insufficient_quota' : auth ? 'invalid_api_key' : 'server_error',
       message: quota ? 'No available channels: quota exhausted' : unrelated ? 'Internal server error' : 'No available channels'}}));
   });
-  for (const route of ['/responses?quota', '/responses?auth', '/responses?other']) {
+  for (const route of ['/responses?quota', '/responses?auth']) {
     await (await fetch(origin + route, {method: 'POST', body: '{}'})).text();
     assert.equal(counts.get(route), 1);
   }
+  // Unknown 503 bodies are generic transport failures and retry to exhaustion.
+  await (await fetch(origin + '/responses?other', {method: 'POST', body: '{}'})).text();
+  assert.equal(counts.get('/responses?other'), 11);
   const response = await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'});
   const text = await response.text();
   assert.equal((text.match(/event: error/g) || []).length, 1);
@@ -696,7 +797,7 @@ test('extended SSE rate-limit recovery stays invisible beyond five retries', asy
   assert.doesNotMatch(text, /discard_|event: error|rate_limit|response.failed/);
   assert.equal(attempts, 9);
   const state = await health();
-  assert.equal(state.filterVersion, 10);
+  assert.equal(state.filterVersion, 11);
   assert.equal(state.retryPolicy.maxRetries, 20);
   assert.equal(state.stats.rateLimitRetries, 8);
   assert.equal(state.stats.rateLimitRetryAccepted, 1);
@@ -727,4 +828,178 @@ test('mixed failures retain per-kind backoff and cannot multiply the total budge
   assert.equal(stats.resourceRetries + stats.availabilityRetries + stats.rateLimitRetries + stats.transportRetries, 20);
   assert.equal(stats.transportRetries, 0);
   assert.ok(rows.some(x => x.event === 'retry-exhausted' && x.retries === 20 && x.kindRetries === 0));
+});
+
+test('lazy history forwards unchanged codex requests byte-for-byte', async t => {
+  const bodies = [];
+  const {origin, health} = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    bodies.push(Buffer.concat(chunks));
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.end(sse('response.completed', {response: {output: [], usage: {
+      input_tokens: 120, output_tokens: 45, input_tokens_details: {cached_tokens: 100}}}}));
+  });
+  // Codex itself always sends store:false plus include reasoning.encrypted_content.
+  const original = JSON.stringify({model: 'gpt-test', store: false, stream: true,
+    include: ['reasoning.encrypted_content'],
+    input: [
+      {type: 'message', id: 'msg_1', role: 'user', content: 'hi'},
+      {type: 'reasoning', id: 'rs_1', encrypted_content: 'cipher', summary: []},
+      {type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'shell', arguments: '{}'}
+    ]});
+  const response = await fetch(origin + '/responses', {method: 'POST', body: original});
+  assert.equal(response.status, 200);
+  assert.equal(bodies.length, 1);
+  assert.ok(bodies[0].equals(Buffer.from(original)));
+  const state = await health();
+  assert.equal(state.stats.reasoningKept, 1);
+  assert.equal(state.stats.removedReasoningItems, 0);
+  assert.equal(state.stats.removedItemIds, 0);
+});
+
+test('streamed completion survives arbitrary UTF-8 and SSE chunk boundaries', async t => {
+  const events = [];
+  const delta = sse('response.output_text.delta', {delta: '开始'});
+  // A named SSE event is sufficient; data.type is optional.
+  const terminal = 'event: response.completed\r\ndata: ' + JSON.stringify({response: {
+    output: [{type: 'message', content: '结束'}], usage: {input_tokens: 9, output_tokens: 4}
+  }}) + '\r\n\r\n';
+  const {origin} = await fixture(t, async (req, res) => {
+    req.resume();
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.write(delta);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const bytes = Buffer.from(terminal);
+    for (let offset = 0; offset < bytes.length; offset += 3) {
+      res.write(bytes.subarray(offset, offset + 3));
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    res.end();
+  }, () => {}, {recorder: {observe: (event, data) => events.push({event, ...data})}});
+  const response = await fetch(origin + '/responses', {method: 'POST', body: '{"store":false,"stream":true}'});
+  assert.equal(await response.text(), delta + terminal);
+  assert.equal(events.filter(row => row.event === 'response-usage').length, 1);
+  assert.deepEqual(events.find(row => row.event === 'response-usage').usage, {input_tokens: 9, output_tokens: 4});
+  assert.equal(events.find(row => row.event === 'request-finished').outcome, 'success');
+});
+
+test('ordinary delta text cannot impersonate a terminal event or cause replay', async t => {
+  let attempts = 0;
+  const events = [];
+  const {origin} = await fixture(t, async (req, res) => {
+    req.resume(); attempts++;
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.write(sse('response.output_text.delta', {delta: 'first'}));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    res.end(sse('response.output_text.delta', {delta: 'literal response.completed here'})
+      + sse('response.output_item.done', {item: {type: 'function_call', call_id: 'only_once'}}));
+  }, () => {}, {recorder: {observe: (event, data) => events.push({event, ...data})}});
+  const response = await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'});
+  const text = await response.text();
+  assert.equal((text.match(/only_once/g) || []).length, 1);
+  assert.equal(attempts, 1);
+  assert.equal(events.filter(row => row.event === 'response-usage').length, 0);
+  assert.equal(events.find(row => row.event === 'request-finished').outcome, 'failed');
+});
+
+test('untyped SSE data is ignored and a same-chunk named completion is recognized', async t => {
+  const events = [];
+  const {origin} = await fixture(t, (req, res) => {
+    req.resume();
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.end('data: {}\n\ndata: null\n\ndata: 7\n\ndata: {"type":7}\n\n'
+      + sse('response.output_text.delta', {delta: 'valid'})
+      + 'event: response.completed\ndata: {"response":{"usage":{"input_tokens":1,"output_tokens":2}}}\n\n');
+  }, () => {}, {recorder: {observe: (event, data) => events.push({event, ...data})}});
+  const response = await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'});
+  assert.match(await response.text(), /valid/);
+  assert.equal(events.find(row => row.event === 'request-finished').outcome, 'success');
+  assert.equal(events.filter(row => row.event === 'response-usage').length, 1);
+});
+
+test('completion without deltas records forwarding and usage exactly once', async t => {
+  const events = [];
+  const {origin} = await fixture(t, (req, res) => {
+    req.resume();
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.end(sse('response.completed', {response: {output: [], usage: {input_tokens: 2, output_tokens: 0}}}));
+  }, () => {}, {recorder: {observe: (event, data) => events.push({event, ...data})}});
+  await (await fetch(origin + '/responses', {method: 'POST', body: '{"stream":true}'})).text();
+  assert.equal(events.filter(row => row.event === 'forwarded').length, 1);
+  assert.equal(events.filter(row => row.event === 'response-usage').length, 1);
+  assert.equal(events.find(row => row.event === 'request-finished').outcome, 'success');
+});
+
+test('HTTP authentication status and either business error field prevent retries', async t => {
+  const counts = new Map();
+  const cases = [
+    {status: 401, error: {code: 'server_error', message: 'Unauthorized'}},
+    {status: 403, error: {code: 'cc_switch_forward_failed', message: 'Forbidden'}},
+    {status: 502, error: {code: 'server_error', type: 'authentication_error', message: 'Denied'}},
+    {status: 503, error: {code: 'server_error', type: 'insufficient_quota', message: 'Exhausted'}}
+  ];
+  const {origin} = await fixture(t, (req, res) => {
+    req.resume(); counts.set(req.url, (counts.get(req.url) || 0) + 1);
+    const selected = cases[Number(req.url.split('=')[1])];
+    res.writeHead(selected.status, {'content-type': 'application/json'});
+    res.end(JSON.stringify({error: selected.error}));
+  });
+  for (let index = 0; index < cases.length; index++) {
+    const route = '/responses?case=' + index;
+    const response = await fetch(origin + route, {method: 'POST', body: '{}'});
+    assert.equal(response.status, cases[index].status);
+    await response.text();
+    assert.equal(counts.get(route), 1);
+  }
+});
+
+test('SSE event names cannot overwrite top-level authentication or quota classifications', async t => {
+  const cases = [
+    {event: 'error', detail: {code: 'server_error', type: 'authentication_error', message: 'Unauthorized'}},
+    {event: 'response.failed', detail: {code: 'invalid_api_key', message: 'Unauthorized'}},
+    {event: 'response.failed', detail: {code: 'server_error', type: 'authentication_error', message: 'Unauthorized'}},
+    {event: 'error', detail: {code: 'server_error', type: 'insufficient_quota', message: 'Exhausted'}}
+  ];
+  const counts = new Map(), events = [];
+  const {origin} = await fixture(t, (req, res) => {
+    req.resume(); counts.set(req.url, (counts.get(req.url) || 0) + 1);
+    const url = new URL(req.url, 'http://local');
+    const selected = cases[Number(url.searchParams.get('case'))];
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    if (url.searchParams.has('after')) res.write(sse('response.output_text.delta', {delta: 'already delivered'}));
+    res.end('event: ' + selected.event + '\ndata: ' + JSON.stringify(selected.detail) + '\n\n');
+  }, (event, data) => events.push({event, ...data}));
+  for (const after of [false, true]) {
+    for (let index = 0; index < cases.length; index++) {
+      const route = '/responses?case=' + index + (after ? '&after=1' : '');
+      const response = await fetch(origin + route, {method: 'POST', body: '{"stream":true}'});
+      await response.text();
+      assert.equal(counts.get(route), 1, route);
+    }
+  }
+  assert.equal(events.filter(row => row.event === 'retry-scheduled').length, 0);
+  assert.equal(events.filter(row => row.event === 'stream-error' && row.kind !== 'other').length, 0);
+});
+
+test('dashboard pushes fresh snapshots while the recorder version is unchanged', {timeout: 5000}, async t => {
+  let snapshots = 0;
+  const {origin} = await fixture(t, (req, res) => { req.resume(); res.end(); }, () => {}, {
+    token: 'offline-control-token', recorder: {snapshot: () => ({version: 1, samples: ++snapshots})}
+  });
+  const controller = new AbortController();
+  try {
+    const response = await fetch(origin + ADMIN + '/ui/stream', {
+      headers: {'x-filter-token': 'offline-control-token'}, signal: controller.signal
+    });
+    const reader = response.body.getReader();
+    let received = '';
+    while ((received.match(/event: snapshot/g) || []).length < 2) {
+      const next = await reader.read();
+      assert.equal(next.done, false);
+      received += Buffer.from(next.value).toString();
+    }
+    assert.match(received, /"samples":1/);
+    assert.match(received, /"samples":2/);
+  } finally { controller.abort(); }
 });

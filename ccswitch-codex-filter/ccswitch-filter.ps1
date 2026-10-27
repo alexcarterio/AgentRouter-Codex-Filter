@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $nodeCommand = Get-Command node -ErrorAction Stop
 if ($Action -eq 'Test') {
-    & $nodeCommand.Source --test (Join-Path $PSScriptRoot 'filter.test.cjs') (Join-Path $PSScriptRoot 'retry.test.cjs')
+    & $nodeCommand.Source --test (Join-Path $PSScriptRoot 'filter.test.cjs') (Join-Path $PSScriptRoot 'retry.test.cjs') (Join-Path $PSScriptRoot 'dashboard.test.cjs')
 } else {
     $operation = $Action.ToLowerInvariant()
     if ($Action -eq 'Run') { $operation = 'serve' }

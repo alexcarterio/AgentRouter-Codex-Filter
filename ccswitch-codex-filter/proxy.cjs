@@ -4,8 +4,9 @@ const http = require('node:http');
 const zlib = require('node:zlib');
 const {timingSafeEqual} = require('node:crypto');
 const {StringDecoder} = require('node:string_decoder');
+const DASHBOARD_HTML = require('./dashboard.cjs');
 const SERVICE = 'ccswitch-codex-reasoning-filter-v1';
-const FILTER_VERSION = 10;
+const FILTER_VERSION = 11;
 const ADMIN = '/__codex_filter__';
 const LIMIT = 64 * 1024 * 1024;
 const ERROR_LIMIT = 64 * 1024;
@@ -28,7 +29,11 @@ class FilterError extends Error {
   }
 }
 
-function filterResponsesRequest(body) {
+// mode 'strip' (v10): history reasoning and portable item ids are always removed.
+// mode 'lazy' (v11 default): history is forwarded intact for reasoning continuity
+// when accepted by the upstream. Only a reported cross-resource error causes
+// that request to degrade to the stripped form and retry.
+function filterResponsesRequest(body, mode = 'strip') {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new FilterError('invalid_request_json', 'Responses request must be a JSON object.');
   }
@@ -47,31 +52,52 @@ function filterResponsesRequest(body) {
       'Encrypted compaction is disabled by this filter. Use a text summary and start a new session.');
   }
   const clean = {...body, store: false};
-  let removed = 0, removedItemIds = 0;
-  if (body.include) clean.include = body.include.filter(value => value !== 'reasoning.encrypted_content');
+  const lazy = mode === 'lazy';
+  let removed = 0, removedItemIds = 0, kept = 0, changed = body.store !== false;
+  if (body.include && !lazy) {
+    const filtered = body.include.filter(value => value !== 'reasoning.encrypted_content');
+    if (filtered.length !== body.include.length) changed = true;
+    clean.include = filtered;
+  }
   if (Array.isArray(body.input)) {
-    clean.input = body.input.filter(item => {
-      if (item?.type === 'reasoning') { removed++; return false; }
-      return true;
-    });
-    clean.input = clean.input.map(item => {
-      if (item?.type === 'compaction' || item?.type === 'item_reference' || item?.encrypted_content) {
-        throw new FilterError('encrypted_context_not_portable',
-          'Encrypted compaction/context references cannot safely cross accounts. Start a new session with a text summary; history has NOT been silently discarded.');
-      }
-      const isMessage = item && item.type === undefined && typeof item.role === 'string' && item.content !== undefined;
-      if (item && (PORTABLE_ITEMS.has(item.type) || isMessage) && Object.hasOwn(item, 'id')) {
-        const portable = {...item};
-        delete portable.id;
-        removedItemIds++;
-        return portable;
-      }
-      return item;
-    });
+    if (lazy) {
+      clean.input = body.input.map(item => {
+        if (item?.type === 'compaction' || item?.type === 'item_reference') {
+          throw new FilterError('encrypted_context_not_portable',
+            'Encrypted compaction/context references cannot safely cross accounts. Start a new session with a text summary; history has NOT been silently discarded.');
+        }
+        if (item?.type === 'reasoning') { kept++; return item; }
+        if (item?.encrypted_content) {
+          throw new FilterError('encrypted_context_not_portable',
+            'Encrypted compaction/context references cannot safely cross accounts. Start a new session with a text summary; history has NOT been silently discarded.');
+        }
+        return item;
+      });
+    } else {
+      clean.input = body.input.filter(item => {
+        if (item?.type === 'reasoning') { removed++; return false; }
+        return true;
+      });
+      clean.input = clean.input.map(item => {
+        if (item?.type === 'compaction' || item?.type === 'item_reference' || item?.encrypted_content) {
+          throw new FilterError('encrypted_context_not_portable',
+            'Encrypted compaction/context references cannot safely cross accounts. Start a new session with a text summary; history has NOT been silently discarded.');
+        }
+        const isMessage = item && item.type === undefined && typeof item.role === 'string' && item.content !== undefined;
+        if (item && (PORTABLE_ITEMS.has(item.type) || isMessage) && Object.hasOwn(item, 'id')) {
+          const portable = {...item};
+          delete portable.id;
+          removedItemIds++;
+          return portable;
+        }
+        return item;
+      });
+      if (removed || removedItemIds) changed = true;
+    }
   }
   // call_id pairs calls/results and is not the server-side item id.
   // Preserve it, this turn's effort, all message contents, and nested resource IDs.
-  return {body: clean, removed, removedItemIds};
+  return {body: clean, removed, removedItemIds, kept, changed};
 }
 
 function localOrigin(value) {
@@ -138,17 +164,25 @@ function isAlbBadRequestPage(text) {
     && /<center>\s*alb\s*<\/center>/i.test(text);
 }
 
+function nonRetryableBusiness(value) {
+  const error = value?.error || value?.response?.error || value;
+  if (!error || typeof error !== 'object') return false;
+  const message = typeof error.message === 'string' ? error.message : '';
+  const codes = [error.code, error.type].map(value => String(value || '').toLowerCase());
+  // Quota/billing errors can share HTTP 429 with temporary token throttling.
+  if (/quota|budget|billing|balance|credit|spend.limit/i.test(codes.join(' ') + ' ' + message)) return true;
+  return codes.some(code => /^(invalid_api_key|authentication_error|permission_denied|unauthorized|forbidden)$/.test(code));
+}
+
 function retryErrorClass(value) {
   const reported = value?.error || value?.response?.error;
   if (value?.type === 'response.failed' && (!reported || (typeof reported === 'object'
       && !reported.code && !reported.type && !reported.message))) return 'transport';
   const error = value?.error || value?.response?.error || value;
   if (!error || typeof error !== 'object') return null;
+  if (nonRetryableBusiness(value)) return null;
   const message = typeof error.message === 'string' ? error.message : '';
   const code = String(error.code || error.type || '');
-  // Quota/billing errors can share HTTP 429 with temporary token throttling.
-  if (/quota|budget|billing|balance|credit|spend.limit/i.test(code + ' ' + message)) return null;
-  if (/^(invalid_api_key|authentication_error|permission_denied|unauthorized|forbidden)$/.test(code)) return null;
   if ((error.type === 'invalid_request_error' || value?.type === 'error' || value?.type === 'response.failed')
       && message.includes('The requested item was created under a different Azure OpenAI resource.')
       && message.includes('Use the same resource that created the item to access it.')) return 'resource';
@@ -158,6 +192,10 @@ function retryErrorClass(value) {
   if (/^(stream_incomplete|stream_disconnected|upstream_idle_timeout|upstream_aborted)$/.test(code)
       || /stream closed before response\.completed|idle timeout waiting for SSE|stream disconnected before completion/i.test(message)) return 'transport';
   if (code === 'no_available_channel' || /无可用渠道|没有可用渠道|no available channels?/i.test(message)) return 'availability';
+  // Relay forwarding failures and malformed/server responses use the bounded
+  // transport retry allowance before any output has been delivered.
+  if (code === 'cc_switch_forward_failed') return 'transport';
+  if (code === 'bad_response' || code === 'server_error') return 'transport';
   return null;
 }
 
@@ -191,8 +229,9 @@ function responseDecoder(encoding) {
 }
 
 function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({}), log = () => {}, limit = LIMIT,
-    retryDelay = retryDelayMs, heartbeatMs = 15000, idleTimeoutMs = 120000, deadlineMs = 1800000}) {
-  const stats = {requests: 0, filteredRequests: 0, removedReasoningItems: 0, removedItemIds: 0,
+    retryDelay = retryDelayMs, heartbeatMs = 15000, idleTimeoutMs = 120000, deadlineMs = 1800000,
+    recorder = null, historyMode = 'lazy', bufferMode = 'stream'}) {
+  const stats = {requests: 0, filteredRequests: 0, removedReasoningItems: 0, removedItemIds: 0, reasoningKept: 0,
     blockedRequests: 0, upstreamErrors: 0, upstreamHttpErrors: 0, lastFilteredAt: null, lastUpstreamStatus: null,
     resourceRetries: 0, resourceRetryAccepted: 0, resourceRetryExhausted: 0,
     rateLimitRetries: 0, rateLimitRetryAccepted: 0, rateLimitRetryExhausted: 0,
@@ -200,6 +239,12 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
     availabilityRetries: 0, availabilityRetryAccepted: 0, availabilityRetryExhausted: 0,
     streamRetryErrors: 0, activeRequests: 0};
   let nextRequestId = 0;
+  // Observation must never take down the forwarding path.
+  const observe = (event, data = {}) => {
+    if (!recorder) return;
+    try { recorder.observe(event, data); } catch {}
+  };
+  const emit = (event, data = {}) => { log(event, data); observe(event, data); };
   const server = http.createServer(async (req, res) => {
     let upstreamRequest, upstreamResponse, responseStream, retryTimer, deadlineTimer, heartbeatTimer;
     let active = false, stopped = false, requestId, outcome, progressTimer;
@@ -218,7 +263,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
       responseStream?.destroy();
       if (active) {
         stats.activeRequests--; active = false;
-        log('request-finished', {requestId, outcome: outcome || 'canceled', durationMs: Date.now() - startedAt});
+        emit('request-finished', {requestId, outcome: outcome || 'canceled', durationMs: Date.now() - startedAt});
       }
     };
     res.once('close', cancel);
@@ -229,26 +274,50 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         throw new FilterError('invalid_target', 'Only origin-form HTTP requests are accepted.');
       }
       const route = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname);
-      if (req.headers.origin || req.headers['sec-fetch-site']) {
-        throw new FilterError('browser_request_rejected', 'Browser requests are not supported.', 403);
-      }
+      const adminAuthorized = () => {
+        const given = Buffer.from(String(req.headers['x-filter-token']
+          || new URL(req.url, 'http://127.0.0.1').searchParams.get('token') || ''));
+        const expected = Buffer.from(String(token || ''));
+        return Boolean(expected.length) && expected.length === given.length && timingSafeEqual(given, expected);
+      };
       if (route === ADMIN + '/health' && req.method === 'GET') {
         res.writeHead(200, {'content-type': 'application/json'});
         res.end(JSON.stringify({service: SERVICE, filterVersion: FILTER_VERSION, pid: process.pid, stats,
           retryPolicy: {maxRetries: MAX_RETRIES, limits: RETRY_LIMITS, deadlineMs}, ...getState()}));
         return;
       }
+      // The dashboard is local-only static HTML; its data stream still requires
+      // the control token, so serving the page before the browser-origin check
+      // does not expose anything the token does not already guard.
+      if (route === ADMIN + '/ui' && req.method === 'GET') {
+        res.writeHead(200, {'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store'});
+        res.end(DASHBOARD_HTML);
+        return;
+      }
+      if (route === ADMIN + '/ui/stream' && req.method === 'GET') {
+        if (!adminAuthorized()) throw new FilterError('invalid_control_token', 'Invalid local control token.', 403);
+        res.writeHead(200, {'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache'});
+        const push = () => {
+          if (res.destroyed || !recorder?.snapshot) return;
+          const snapshot = recorder.snapshot();
+          res.write('event: snapshot\ndata: ' + JSON.stringify({snapshot, state: getState()}) + '\n\n');
+        };
+        push();
+        const pushTimer = setInterval(push, 1000);
+        const pingTimer = setInterval(() => { if (!res.destroyed) res.write(': ping\n\n'); }, 15000);
+        res.once('close', () => { clearInterval(pushTimer); clearInterval(pingTimer); });
+        return;
+      }
       if (route.startsWith(ADMIN)) {
-        const given = Buffer.from(String(req.headers['x-filter-token'] || ''));
-        const expected = Buffer.from(String(token || ''));
-        if (!expected.length || expected.length !== given.length || !timingSafeEqual(given, expected)) {
-          throw new FilterError('invalid_control_token', 'Invalid local control token.', 403);
-        }
+        if (!adminAuthorized()) throw new FilterError('invalid_control_token', 'Invalid local control token.', 403);
         if (route !== ADMIN + '/stop' || req.method !== 'POST') throw new FilterError('unknown_control_route', 'Unknown control route.', 404);
         await onStop();
         res.writeHead(200, {'content-type': 'application/json'});
         res.end('{"stopping":true}');
         return;
+      }
+      if (req.headers.origin || req.headers['sec-fetch-site']) {
+        throw new FilterError('browser_request_rejected', 'Browser requests are not supported.', 403);
       }
       if (/\/responses\/compact\/?$/.test(route)) {
         throw new FilterError('encrypted_compaction_disabled',
@@ -258,17 +327,17 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
       if (Number(upstream.port || 80) === server.address().port) throw new FilterError('proxy_loop', 'CC Switch and filter must use different ports.', 503);
       const headers = cleanHeaders(req.headers);
       headers.host = upstream.host;
-      let body, requestedStream = false;
+      let body, requestedStream = false, input;
       const isResponses = /\/responses\/?$/.test(route) && req.method === 'POST';
       requestId = ++nextRequestId;
       if (isResponses) {
         const raw = decodeBody(await readBody(req, limit), req.headers['content-encoding'], limit);
-        let input;
         try { input = JSON.parse(raw.toString('utf8')); }
         catch { throw new FilterError('invalid_request_json', 'Responses request is not valid JSON.'); }
-        const filtered = filterResponsesRequest(input);
+        const filtered = filterResponsesRequest(input, historyMode);
         requestedStream = filtered.body.stream === true;
-        body = Buffer.from(JSON.stringify(filtered.body));
+        // Unchanged lazy requests skip re-serialization entirely.
+        body = filtered.changed ? Buffer.from(JSON.stringify(filtered.body)) : raw;
         delete headers['content-encoding'];
         delete headers.expect;
         headers['content-type'] = 'application/json';
@@ -276,8 +345,10 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         stats.filteredRequests++;
         stats.removedReasoningItems += filtered.removed;
         stats.removedItemIds += filtered.removedItemIds;
+        stats.reasoningKept += filtered.kept || 0;
         stats.lastFilteredAt = new Date().toISOString();
-        log('filtered', {requestId, removed: filtered.removed, removedItemIds: filtered.removedItemIds});
+        emit('filtered', {requestId, removed: filtered.removed, removedItemIds: filtered.removedItemIds,
+          kept: filtered.kept || 0, unchanged: !filtered.changed, mode: historyMode});
       }
       if (res.destroyed || req.aborted) return;
       stats.requests++;
@@ -286,8 +357,10 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
       let retries = 0, phase = 'upstream';
       const retriesByKind = {resource: 0, rateLimit: 0, transport: 0, availability: 0};
       const retryKinds = new Set();
-      const requestLog = (event, data = {}) => log(event, {requestId, ...data});
-      requestLog('request-started', {streaming: requestedStream, maxRetries: MAX_RETRIES, retryLimits: RETRY_LIMITS, deadlineMs});
+      let everForwarded = false;
+      const requestLog = (event, data = {}) => emit(event, {requestId, ...data});
+      requestLog('request-started', {streaming: requestedStream, maxRetries: MAX_RETRIES, retryLimits: RETRY_LIMITS,
+        deadlineMs, model: isResponses ? input?.model : undefined, requestBytes: isResponses ? body.length : 0});
       progressTimer = setInterval(() => requestLog('request-progress', {
         phase, retries, maxRetries: MAX_RETRIES,
         elapsedMs: Date.now() - startedAt, remainingMs: Math.max(0, deadlineMs - (Date.now() - startedAt))
@@ -324,8 +397,22 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
           res.end(errorBody);
         }
       };
+      // Lazy history: keep reasoning continuity until the upstream itself reports
+      // the cross-resource error; only then retry with the v10 stripped body.
+      let degraded = false;
+      const maybeDegrade = () => {
+        if (degraded || !isResponses || historyMode !== 'lazy') return;
+        const result = filterResponsesRequest(input, 'strip');
+        degraded = true;
+        body = Buffer.from(JSON.stringify(result.body));
+        headers['content-length'] = String(body.length);
+        stats.removedReasoningItems += result.removed;
+        stats.removedItemIds += result.removedItemIds;
+        requestLog('history-degraded', {removed: result.removed, removedItemIds: result.removedItemIds});
+      };
       const schedule = (kind, response, errorCode = errorLabel(kind)) => {
         if (!kind) return false;
+        if (kind === 'resource') maybeDegrade();
         const kindRetries = retriesByKind[kind], maxKindRetries = RETRY_LIMITS[kind];
         const limitReached = retries >= MAX_RETRIES || kindRetries >= maxKindRetries;
         const delayMs = limitReached ? 0 : retryDelay(kind, kindRetries, response.headers);
@@ -356,7 +443,9 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         outcome = 'success';
         stopHeartbeat();
         for (const kind of retryKinds) stats[kind + 'RetryAccepted']++;
-        if (retries) requestLog('retry-accepted', {retries, status: response.statusCode});
+        if (retries) {
+          requestLog('retry-accepted', {retries, status: response.statusCode});
+        }
       };
       const failed = error => {
         if (stopped || res.destroyed) return;
@@ -373,7 +462,9 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
         requestLog('retry-exhausted', {kind: 'transport', errorCode: 'request_deadline', retries,
           maxRetries: MAX_RETRIES, deadline: true});
         stats.transportRetryExhausted++;
-        disposeAttempt(); failed(new Error('upstream_timeout'));
+        disposeAttempt();
+        if (everForwarded && res.headersSent && !stopped) { outcome = 'failed'; res.destroy(); }
+        else failed(new Error('upstream_timeout'));
       }, deadlineMs);
       const dispatch = () => {
         if (stopped || res.destroyed) return;
@@ -391,7 +482,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
           if (discarded || settled || stopped || res.destroyed) return;
           settled = true;
           discard();
-          requestLog('transport-error', {code: error.code || error.message || 'stream_closed', errorCode: 'stream_incomplete', retryable: isResponses});
+          requestLog('transport-error', {kind: 'transport', code: error.code || error.message || 'stream_closed', errorCode: 'stream_incomplete', retryable: isResponses});
           if (isResponses && schedule('transport', {headers: {}})) return;
           finishError({statusCode: 502, headers: {}}, Buffer.from(JSON.stringify({error: {
             code: 'stream_incomplete', message: 'Upstream stream disconnected before completion or timed out.'}})));
@@ -411,6 +502,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
           const forward = prefix => {
             if (stopped || res.destroyed) return;
             settled = true;
+            everForwarded = true;
             response.removeListener('error', attemptFailed);
             response.removeAllListeners('aborted');
             response.on('error', failed);
@@ -419,6 +511,8 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             if (response.statusCode >= 400) outcome = 'failed';
             else outcome = 'success';
             stopHeartbeat();
+            observe('forwarded', {requestId, ttfbMs: Date.now() - startedAt,
+              status: response.statusCode, streaming: false});
             if (!res.headersSent) {
               res.writeHead(response.statusCode, cleanHeaders(response.headers));
               res.flushHeaders();
@@ -443,7 +537,25 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             } catch (error) { attemptFailed(error); return; }
             const decoder = new StringDecoder('utf8');
             const chunks = [];
-            let size = 0, pending = '';
+            let size = 0, pending = '', forwarded = false, completedSeen = false;
+            const parseFrame = frame => {
+              const lines = frame.split(/\r?\n/);
+              const data = lines.filter(line => /^data:/.test(line))
+                .map(line => line.slice(5).replace(/^ /, '')).join('\n');
+              if (!data || data.trim() === '[DONE]') return null;
+              let value;
+              try { value = JSON.parse(data); } catch { return null; }
+              if (!value || typeof value !== 'object') return null;
+              const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim()
+                || (typeof value.type === 'string' ? value.type : '');
+              return {event, value};
+            };
+            const markCompleted = value => {
+              if (completedSeen) return;
+              completedSeen = true;
+              accepted(response);
+              if (value.response?.usage) observe('response-usage', {requestId, usage: value.response.usage});
+            };
             const detach = () => {
               stream.removeListener('data', inspect);
               stream.removeListener('end', ended);
@@ -451,37 +563,73 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             const finish = (success = true) => {
               settled = true;
               detach();
-              if (success) accepted(response);
-              else { outcome = 'failed'; stopHeartbeat(); }
+              if (!success) { outcome = 'failed'; stopHeartbeat(); }
+              everForwarded = true;
+              observe('forwarded', {requestId, ttfbMs: Date.now() - startedAt,
+                status: response.statusCode, streaming: true});
               if (!res.headersSent) {
                 res.writeHead(200, cleanHeaders(response.headers)); res.flushHeaders();
               }
               res.end(Buffer.concat(chunks));
               discard();
             };
+            // After the first content event nothing may be retried without
+            // duplicating delivered output, so from here on the stream is passed
+            // through untouched and only tapped passively for usage metrics.
+            const forwardStream = () => {
+              if (stopped || res.destroyed) return;
+              forwarded = true;
+              settled = true;
+              everForwarded = true;
+              // Inspect the remainder of this chunk, then continue the same
+              // decoder and frame buffer across every upstream chunk.
+              tap();
+              detach();
+              response.removeListener('error', attemptFailed);
+              response.removeAllListeners('aborted');
+              const afterForward = code => {
+                if (stopped || res.destroyed) return;
+                outcome = 'failed';
+                requestLog('transport-error', {kind: 'transport', code, errorCode: 'stream_incomplete', retryable: false});
+                res.destroy();
+              };
+              response.on('error', () => afterForward('upstream_error_after_forward'));
+              response.on('aborted', () => afterForward('upstream_aborted_after_forward'));
+              stream.on('error', () => afterForward('upstream_error_after_forward'));
+              stream.on('data', tap);
+              stream.on('end', endedAfterForward);
+              upstreamRequest.setTimeout(0);
+              phase = 'streaming';
+              stopHeartbeat();
+              observe('forwarded', {requestId, ttfbMs: Date.now() - startedAt,
+                status: response.statusCode, streaming: true});
+              if (!res.headersSent) {
+                res.writeHead(response.statusCode, cleanHeaders(response.headers));
+                res.flushHeaders();
+              }
+              if (chunks.length) res.write(Buffer.concat(chunks));
+              stream.pipe(res);
+            };
             const inspect = chunk => {
               if (discarded || settled || stopped) return;
               chunks.push(chunk); size += chunk.length;
               if (size > limit) {
                 settled = true; detach(); discard();
-              requestLog('response-buffer-exceeded', {limit, code: 'response_too_large'});
+                requestLog('response-buffer-exceeded', {limit, code: 'response_too_large'});
                 finishError({statusCode: 502, headers: {}}, Buffer.from(JSON.stringify({error: {
                   code: 'response_too_large', message: 'Buffered response exceeds filter size limit.'}})));
                 return;
               }
               pending += decoder.write(chunk);
-              let boundary;
+              let boundary, trigger = false;
               while ((boundary = /\r?\n\r?\n/.exec(pending))) {
                 const frame = pending.slice(0, boundary.index);
                 pending = pending.slice(boundary.index + boundary[0].length);
-                const lines = frame.split(/\r?\n/);
-                const data = lines.filter(line => /^data:/.test(line)).map(line => line.slice(5).replace(/^ /, '')).join('\n');
-                if (!data || data.trim() === '[DONE]') continue;
-                let value;
-                try { value = JSON.parse(data); } catch { continue; }
-                const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim() || value.type;
+                const parsed = parseFrame(frame);
+                if (!parsed) continue;
+                const {event, value} = parsed;
                 if (event === 'error' || event === 'response.failed') {
-                  const kind = retryErrorClass({...value, type: event});
+                  const kind = nonRetryableBusiness(value) ? null : retryErrorClass({...value, type: event});
                   const detail = value.error || value.response?.error || value;
                   const code = String(detail.code || detail.type || 'other').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
                   const missingDetails = kind === 'transport' && event === 'response.failed'
@@ -505,14 +653,46 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
                       : value.error || value.response?.error || value})));
                   return;
                 }
-                if (event === 'response.completed') { finish(); return; }
+                if (event === 'response.completed') {
+                  markCompleted(value);
+                  finish();
+                  return;
+                }
                 if (event === 'response.incomplete') { finish(false); return; }
+                if (bufferMode === 'stream' && !forwarded && event.endsWith('.delta')) { trigger = true; break; }
               }
+              if (trigger) forwardStream();
             };
             const ended = () => {
               if (settled || discarded || stopped || res.destroyed) return;
               detach();
               attemptFailed(new Error('stream_closed_before_completed'));
+            };
+            const tap = chunk => {
+              if (completedSeen || stopped || !forwarded) return;
+              if (chunk) pending += decoder.write(chunk);
+              let boundary;
+              while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+                const frame = pending.slice(0, boundary.index);
+                pending = pending.slice(boundary.index + boundary[0].length);
+                const parsed = parseFrame(frame);
+                if (!parsed) continue;
+                const {event, value} = parsed;
+                if (event === 'response.completed') { markCompleted(value); return; }
+                if (event === 'error' || event === 'response.failed' || event === 'response.incomplete') {
+                  outcome = 'failed';
+                  const kind = nonRetryableBusiness(value) ? null : retryErrorClass({...value, type: event});
+                  requestLog('stream-error', {kind: kind || 'other',
+                    errorCode: 'error_after_content', errorDetailsPresent: !!(value.error || value.response?.error),
+                    retryable: false});
+                }
+              }
+            };
+            const endedAfterForward = () => {
+              if (!forwarded || completedSeen || stopped) return;
+              outcome = 'failed';
+              requestLog('transport-error', {kind: 'transport', code: 'stream_closed_after_forward',
+                errorCode: 'stream_incomplete', retryable: false});
             };
             stream.on('data', inspect);
             stream.once('end', ended);
@@ -541,15 +721,21 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             let value, decoded;
             try { decoded = decodeBody(errorBody, response.headers['content-encoding'], ERROR_LIMIT).toString('utf8'); } catch {}
             try { value = JSON.parse(decoded); } catch {}
-            // Only the known ALB HTML page is retried; generic HTTP 400 and
-            // explicit auth/quota/parameter errors keep their existing behavior.
+            // Only the known ALB HTML page is retried among 400s; generic HTTP
+            // 400 and explicit auth/quota/parameter errors keep their behavior.
             const albBadRequest = response.statusCode === 400 && isAlbBadRequestPage(
               value ? value.error?.code === 'cc_switch_upstream_error' ? value.error.message : '' : decoded);
             const detected = retryErrorClass(value);
-            const kind = albBadRequest ? 'transport' : ((detected === 'resource' && response.statusCode === 400)
+            let kind = albBadRequest ? 'transport' : ((detected === 'resource' && response.statusCode === 400)
               || (detected === 'rateLimit' && [400, 429].includes(response.statusCode))
               || detected === 'transport'
               || (detected === 'availability' && response.statusCode === 503) ? detected : null);
+            // Generic relay/gateway 5xx bodies were the top source of avoidable
+            // client-visible failures in production; treat them as transport.
+            if (!kind && response.statusCode >= 500 && !albBadRequest && !nonRetryableBusiness(value)) {
+              kind = 'transport';
+            }
+            if ([401, 403].includes(response.statusCode) || nonRetryableBusiness(value)) kind = null;
             const code = String(value?.error?.code || value?.error?.type || 'other').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
             const errorCode = albBadRequest ? 'alb_bad_request' : kind ? errorLabel(kind) : code;
             requestLog('http-error', {status: response.statusCode, kind: kind || 'other', errorCode});
@@ -582,4 +768,5 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
   return server;
 }
 
-module.exports = {SERVICE, ADMIN, FilterError, filterResponsesRequest, localOrigin, makeProxy, decodeBody, retryDelayMs};
+module.exports = {SERVICE, ADMIN, FILTER_VERSION, FilterError, filterResponsesRequest, localOrigin, makeProxy,
+  decodeBody, retryDelayMs, nonRetryableBusiness};

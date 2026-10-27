@@ -7,8 +7,9 @@ const http = require('node:http');
 const net = require('node:net');
 const {spawn} = require('node:child_process');
 const {randomBytes} = require('node:crypto');
-const {SERVICE, ADMIN, makeProxy, localOrigin} = require('./proxy.cjs');
-const {ConfigRouter, discoverCcSwitch} = require('./config.cjs');
+const {SERVICE, ADMIN, FILTER_VERSION, makeProxy, localOrigin} = require('./proxy.cjs');
+const {ConfigRouter, discoverCcSwitch, atomicWrite} = require('./config.cjs');
+const {Recorder} = require('./metrics.cjs');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const LOG_MAX_BYTES = 4 * 1024 * 1024;
@@ -31,6 +32,39 @@ function pruneLog(filename, now = Date.now(), maxBytes = LOG_MAX_BYTES) {
   const temporary = filename + '.tmp';
   fs.writeFileSync(temporary, retained);
   fs.renameSync(temporary, filename);
+}
+// Buffered appender: request handling never waits on disk; the log file is
+// reopened on every flush so retention/rotation can safely rename it.
+function createLogWriter(filename, {maxBytes = LOG_MAX_BYTES, flushMs = 100} = {}) {
+  let queue = [], timer = null, flushing = null, bytes = 0;
+  try { bytes = fs.statSync(filename).size; } catch {}
+  const schedule = () => {
+    if (timer) return;
+    timer = setTimeout(() => { timer = null; flush(); }, flushMs);
+  };
+  const flush = async () => {
+    clearTimeout(timer);
+    timer = null;
+    if (flushing) { await flushing; return flush(); }
+    if (!queue.length) return;
+    const payload = queue.join('');
+    queue = [];
+    flushing = fs.promises.appendFile(filename, payload)
+      .then(() => { bytes += Buffer.byteLength(payload); }).catch(() => {});
+    await flushing;
+    flushing = null;
+    if (bytes > maxBytes) {
+      try { pruneLog(filename); bytes = fs.statSync(filename).size; } catch { bytes = 0; }
+    }
+    if (queue.length) await flush();
+  };
+  const write = line => {
+    queue.push(line + '\n');
+    if (queue.length >= 128) flush();
+    else schedule();
+  };
+  write.flush = flush;
+  return write;
 }
 function jsonFile(filename) {
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')); }
@@ -80,7 +114,9 @@ function reachable(origin) {
 }
 function parseArgs(argv) {
   const command = (argv.shift() || 'help').toLowerCase();
-  if (!['help', 'start', 'serve', 'stop', 'status', 'logs'].includes(command)) throw new Error('Use start, stop, status, logs or serve.');
+  if (!['help', 'start', 'serve', 'stop', 'status', 'logs', 'ui'].includes(command)) {
+    throw new Error('Use start, stop, status, logs, ui or serve.');
+  }
   const values = {};
   const names = new Set(['port', 'upstream', 'config', 'runtime', 'cc-db']);
   while (argv.length) {
@@ -99,7 +135,7 @@ function parseArgs(argv) {
 }
 function files(options) {
   return {state: path.join(options.runtime, 'service.json'), backup: path.join(options.runtime, 'routes.json'),
-    log: path.join(options.runtime, 'filter.log')};
+    log: path.join(options.runtime, 'filter.log'), metrics: path.join(options.runtime, 'metrics.json')};
 }
 function routerFor(options, backup, getUpstream, log) {
   return new ConfigRouter({configPath: options.configPath, filterOrigin: options.filterOrigin,
@@ -121,16 +157,19 @@ async function serve(options) {
     if (alive(previous.pid) || await health(previous)) throw new Error('A filter process is already running. Use status or stop.');
     fs.unlinkSync(locations.state);
   }
+  const recorder = new Recorder();
+  recorder.hydrate(jsonFile(locations.metrics));
+  pruneLog(locations.log);
   // Exclusive creation serializes simultaneous starts; don't overwrite another instance.
   fs.writeFileSync(locations.state, JSON.stringify(record, null, 2), {flag: 'wx', mode: 0o600});
-  let router, server, timer, logTimer, stopping = false, lastError = null;
-  pruneLog(locations.log);
+  let router, server, timer, logTimer, metricsTimer, stopping = false, lastError = null;
+  const writer = createLogWriter(locations.log);
   const log = (event, data = {}) => {
     const line = JSON.stringify({time: new Date().toISOString(), event, ...data});
-    fs.appendFileSync(locations.log, line + '\n');
-    if (fs.statSync(locations.log).size > LOG_MAX_BYTES) pruneLog(locations.log);
+    writer(line);
     console.log(line);
   };
+  const flushMetrics = () => { try { atomicWrite(locations.metrics, JSON.stringify(recorder.toJSON())); } catch {} };
   const cleanup = () => removeOwnState(locations.state, instance);
   const shutdown = () => {
     if (stopping) return;
@@ -139,19 +178,28 @@ async function serve(options) {
     stopping = true;
     clearInterval(timer);
     clearInterval(logTimer);
+    clearInterval(metricsTimer);
+    flushMetrics();
     log('stopping');
     setTimeout(() => {
       const force = setTimeout(() => server.closeAllConnections(), 10000);
       force.unref();
-      server.close(() => { clearTimeout(force); cleanup(); log('stopped'); });
+      server.close(async () => {
+        clearTimeout(force);
+        flushMetrics();
+        log('stopped');
+        await writer.flush();
+        cleanup();
+      });
       server.closeIdleConnections();
     }, 50);
   };
   try {
     router = routerFor(options, locations.backup, () => upstream, log);
-    server = makeProxy({getUpstream: () => upstream, token: record.token, onStop: shutdown, log,
+    server = makeProxy({getUpstream: () => upstream, token: record.token, onStop: shutdown, log, recorder,
       getState: () => ({instance, state: stopping ? 'stopping' : router.state, upstream,
         filterOrigin: options.filterOrigin, configPath: options.configPath, lastError,
+        filterVersion: FILTER_VERSION, historyMode: 'lazy', bufferMode: 'stream', dashboard: ADMIN + '/ui',
         logPolicy: {retentionHours: 24, maxBytes: LOG_MAX_BYTES, cleanupIntervalMs: 60000}})});
     await new Promise((resolve, reject) => {
       server.once('error', reject);
@@ -175,6 +223,8 @@ async function serve(options) {
     timer = setInterval(tick, 1000);
     logTimer = setInterval(() => pruneLog(locations.log), 60000);
     logTimer.unref();
+    metricsTimer = setInterval(flushMetrics, 60000);
+    metricsTimer.unref();
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
       try { shutdown(); }
       catch (error) { log('restore-failed', {message: error.message}); }
@@ -183,9 +233,12 @@ async function serve(options) {
   } catch (error) {
     clearInterval(timer);
     clearInterval(logTimer);
+    clearInterval(metricsTimer);
+    flushMetrics();
     log('service-error', {code: error.code || 'startup_failed'});
     if (server?.listening) server.close();
     cleanup();
+    await writer.flush();
     throw error;
   }
 }
@@ -251,6 +304,21 @@ async function stop(options) {
   if (record) removeOwnState(locations.state, record.instance);
   return {running: false, state: 'stopped', restored: !!backup};
 }
+async function ui(options) {
+  const locations = files(options);
+  const record = jsonFile(locations.state);
+  const running = await health(record);
+  if (!running) throw new Error('Filter is not running. Start it first: node filter.cjs start');
+  const url = running.filterOrigin + ADMIN + '/ui#' + record.token;
+  let opened = false;
+  if (process.platform === 'win32') {
+    try {
+      spawn('cmd', ['/c', 'start', '', url], {detached: true, windowsHide: true, stdio: 'ignore'}).unref();
+      opened = true;
+    } catch {}
+  }
+  return {url, opened};
+}
 
 function formatLog(row) {
   const time = row.time ? new Date(row.time).toLocaleTimeString('zh-CN', {hour12: false}) : '--:--:--';
@@ -269,8 +337,12 @@ function formatLog(row) {
   switch (row.event) {
     case 'request-started': message = `START streaming=${row.streaming} maxRetries=${row.maxRetries} deadline=${row.deadlineMs / 1000}s`;
       note = `请求开始：最多额外重试 ${row.maxRetries} 次，总期限 ${row.deadlineMs / 1000} 秒`; break;
-    case 'filtered': message = `FILTER removedReasoning=${row.removed} removedIds=${row.removedItemIds}`;
-      note = `历史过滤完成：移除 ${row.removed} 项推理、${row.removedItemIds} 个历史 ID`; break;
+    case 'filtered': message = `FILTER removedReasoning=${row.removed} removedIds=${row.removedItemIds} keptReasoning=${row.kept ?? 0}`;
+      note = row.mode === 'lazy'
+        ? `历史过滤完成：保留 ${row.kept ?? 0} 项历史推理（懒模式）${row.removed || row.removedItemIds ? `，移除 ${row.removed} 项推理、${row.removedItemIds} 个历史 ID` : '，无需修改请求'}`
+        : `历史过滤完成：移除 ${row.removed} 项推理、${row.removedItemIds} 个历史 ID`; break;
+    case 'history-degraded': message = `DEGRADE removedReasoning=${row.removed} removedIds=${row.removedItemIds}`;
+      note = `遇到历史资源归属类错误，从本次重试起改用移除历史思维链/ID 的保守请求体（相当于旧版行为）`; break;
     case 'http-error': case 'stream-error': case 'transport-error':
       message = `FAIL ${code}${row.status ? ' HTTP=' + row.status : ''}${row.code ? ' cause=' + row.code : ''}`;
       note = `本次尝试失败：${codeNote}；${row.kind && row.kind !== 'other' ? '按分类进行有限重试，结果见后续记录' : '未命中可重试分类，本次直接返回客户端'}`; break;
@@ -290,12 +362,13 @@ function formatLog(row) {
       note = ({success: '请求成功完成', failed: '请求最终失败', canceled: '客户端连接已关闭，请求已取消'})[row.outcome] || '请求已结束';
       note += `；总耗时 ${(row.durationMs / 1000).toFixed(3)} 秒（含上游响应和重试等待）`; break;
     case 'request-progress': message = `PENDING ${row.phase} retries=${row.retries}/${row.maxRetries || 5} elapsed=${Math.floor(row.elapsedMs / 1000)}s remaining=${Math.ceil(row.remainingMs / 1000)}s`;
-      note = row.phase === 'backoff' ? '正在等待重试间隔' : '正在等待 CC Switch / 上游完整响应，内容暂存中';
+      note = row.phase === 'backoff' ? '正在等待重试间隔' : row.phase === 'streaming'
+        ? '已开始向客户端流式转发上游内容' : '正在等待 CC Switch / 上游响应';
       note += `；已用 ${Math.floor(row.elapsedMs / 1000)} 秒，剩余 ${Math.ceil(row.remainingMs / 1000)} 秒`; break;
     case 'upstream-http-error': message = `HTTP ${row.status}`; note = '上游返回错误状态，具体分类见后续 FAIL'; break;
     case 'upstream-error': case 'blocked': case 'response-buffer-exceeded': case 'service-error': message = `FAIL ${code}`;
       note = row.event === 'blocked' ? '过滤器拒绝了该请求，查看英文错误码' : codeNote; break;
-    case 'listening': message = `READY ${row.state} ${row.filterOrigin}`; note = '过滤服务已开始监听'; break;
+    case 'listening': message = `READY ${row.state} ${row.filterOrigin}`; note = '过滤服务已开始监听；网页观测台: node filter.cjs ui'; break;
     case 'stopping': case 'stopped': message = row.event.toUpperCase(); note = row.event === 'stopping' ? '过滤服务正在停止' : '过滤服务已停止'; break;
     case 'state': case 'config-state': message = `STATE ${row.state}`; note = '配置接入状态变化'; break;
     default: return null;
@@ -314,8 +387,8 @@ async function logs(options) {
   }
   const state = await status(options);
   console.log(`Filter v${state.filterVersion || '?'} running=${state.running} state=${state.state} active=${state.stats?.activeRequests ?? 0} // 版本、运行状态、接入状态、正在处理的请求数`);
-  console.log('实时日志：SUCCESS 成功 / FAIL 本次失败 / WAIT 等待 / RETRY 重试 / EXHAUSTED 重试次数或期限耗尽 / CANCELED 取消。');
-  console.log('同一编号对应同一请求；PENDING 每 15 秒更新等待进度。Ctrl+C 或关闭窗口只结束日志查看，不停止过滤服务。');
+  console.log(`实时日志：SUCCESS 成功 / FAIL 本次失败 / WAIT 等待 / RETRY 重试 / EXHAUSTED 重试次数或期限耗尽 / DEGRADE 报错后降级历史。`);
+  console.log('同一编号对应同一请求；PENDING 每 15 秒更新等待进度。网页观测台（图表与聚合）：node filter.cjs ui。');
   console.log('仅显示本窗口打开后的新日志；原始日志保留最近 24 小时，最多 4 MiB，繁忙时优先保留最新记录。');
   const print = line => {
     try { const value = formatLog(JSON.parse(line)); if (value) console.log(value); }
@@ -367,10 +440,14 @@ async function main() {
   if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node.js 24 or later is required (built-in SQLite and zstd).');
   const options = parseArgs(process.argv.slice(2));
   if (options.command === 'help') {
-    console.log('node filter.cjs start|stop|status|logs|serve [--port 18181] [--upstream http://127.0.0.1:15721] [--config PATH] [--runtime PATH] [--cc-db PATH]');
+    console.log('node filter.cjs start|stop|status|logs|ui|serve [--port 18181] [--upstream http://127.0.0.1:15721] [--config PATH] [--runtime PATH] [--cc-db PATH]');
   } else if (options.command === 'serve') await serve(options);
   else if (options.command === 'logs') await logs(options);
-  else console.log(JSON.stringify(await ({start, stop, status}[options.command])(options), null, 2));
+  else if (options.command === 'ui') {
+    const result = await ui(options);
+    console.log('观测台地址（含本机访问令牌，请勿外传）: ' + result.url);
+    if (!result.opened) console.log('请手动在浏览器打开上述地址。');
+  } else console.log(JSON.stringify(await ({start, stop, status}[options.command])(options), null, 2));
 }
 if (require.main === module) main().catch(error => { console.error('Filter: ' + error.message); process.exitCode = 1; });
-module.exports = {parseArgs, start, stop, status, serve, request, formatLog, pruneLog};
+module.exports = {parseArgs, start, stop, status, serve, ui, request, formatLog, pruneLog, createLogWriter};

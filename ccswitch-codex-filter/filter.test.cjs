@@ -11,7 +11,7 @@ const {once} = require('node:events');
 const {spawn} = require('node:child_process');
 const {makeProxy, filterResponsesRequest, localOrigin, ADMIN} = require('./proxy.cjs');
 const {ConfigRouter, providerBase} = require('./config.cjs');
-const {start, stop, status, parseArgs, pruneLog} = require('./filter.cjs');
+const {start, stop, status, parseArgs, pruneLog, createLogWriter} = require('./filter.cjs');
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -116,7 +116,7 @@ test('upstream accepts replayed history with no resource-bound item IDs and inta
     res.end(JSON.stringify(foreign ? {error: 'The requested item was created under a different resource.'} : {paired}));
   });
   const upstreamOrigin = await listen(upstream);
-  const proxy = makeProxy({getUpstream: () => upstreamOrigin});
+  const proxy = makeProxy({getUpstream: () => upstreamOrigin, historyMode: 'strip'});
   const origin = await listen(proxy);
   t.after(async () => { await close(proxy); await close(upstream); });
   const body = JSON.stringify(sample);
@@ -148,7 +148,7 @@ test('HTTP filtering handles all compressed forms and preserves authorization, p
     res.end('{"from":"upstream"}');
   });
   const upstreamOrigin = await listen(upstream);
-  const proxy = makeProxy({getUpstream: () => upstreamOrigin});
+  const proxy = makeProxy({getUpstream: () => upstreamOrigin, historyMode: 'strip'});
   const origin = await listen(proxy);
   t.after(async () => { await close(proxy); await close(upstream); });
   const raw = Buffer.from(JSON.stringify(sample));
@@ -177,7 +177,7 @@ test('HTTP filtering handles all compressed forms and preserves authorization, p
   const health = JSON.parse((await call(origin, ADMIN + '/health', {method: 'GET'})).body);
   assert.equal(health.stats.filteredRequests, 7);
   assert.equal(health.stats.removedReasoningItems, 7);
-  assert.equal(health.filterVersion, 10);
+  assert.equal(health.filterVersion, 11);
   assert.equal(health.stats.removedItemIds, 35);
   assert.equal(health.stats.upstreamHttpErrors, 5);
   assert.equal(health.stats.lastUpstreamStatus, 200);
@@ -195,7 +195,7 @@ test('HTTP filtering handles all compressed forms and preserves authorization, p
   await call(origin, '/models', {method: 'GET'});
   assert.equal(captured.at(-1).path, '/models');
 });
-test('SSE keepalive arrives before completion while model output is buffered; cancel closes upstream', {timeout: 10000}, async t => {
+test('SSE content streams to the client before upstream completion; cancel closes upstream', {timeout: 10000}, async t => {
   let finish;
   const gate = new Promise(resolve => { finish = resolve; });
   let disconnected;
@@ -213,17 +213,21 @@ test('SSE keepalive arrives before completion while model output is buffered; ca
   t.after(async () => { finish(); await close(proxy); await close(upstream); });
   await new Promise((resolve, reject) => {
     const req = http.request(origin + '/responses', {method: 'POST'}, res => {
-      let received = '', released = false;
+      let received = '', streamed = false;
       res.on('data', chunk => {
         received += chunk;
-        if (!released && received.includes('response.in_progress')) {
-          assert.doesNotMatch(received, /"first"/);
-          released = true;
+        if (!streamed && received.includes('"first"')) {
+          streamed = true;
+          try { assert.doesNotMatch(received, /response\.completed/); }
+          catch (error) { reject(error); }
+          // Content arrived before upstream completion: release the gate so the
+          // upstream can finish and the completion event can be observed.
           finish();
         }
       });
       res.on('end', () => {
-        try { assert.match(received, /response.completed/); resolve(); } catch (error) { reject(error); }
+        try { assert.match(received, /"first"/); assert.match(received, /response\.completed/); resolve(); }
+        catch (error) { reject(error); }
       });
       res.on('error', reject);
     });
@@ -335,9 +339,12 @@ test('background start/status/idempotent start/stop and offline recovery', {time
   assert.equal(providerBase(fs.readFileSync(configPath, 'utf8')).url, filterOrigin + '/v1');
   assert.equal((await start(options)).pid, first.pid);
   await call(filterOrigin, '/responses', {body: JSON.stringify(sample)});
-  assert.equal((await status(options)).stats.removedReasoningItems, 1);
-  assert.equal((await status(options)).stats.removedItemIds, 5);
+  // Lazy mode keeps codex's reasoning history; nothing needs stripping here.
+  assert.equal((await status(options)).stats.reasoningKept, 1);
+  assert.equal((await status(options)).stats.removedReasoningItems, 0);
   assert.equal((await stop(options)).restored, true);
+  assert.ok(fs.readFileSync(path.join(options.runtime, 'filter.log'), 'utf8')
+    .split('\n').some(line => { try { return JSON.parse(line).event === 'stopped'; } catch { return false; } }));
   assert.equal(fs.readFileSync(configPath, 'utf8'), original);
   assert.equal((await status(options)).running, false);
   // Emulate an abrupt exit after config rewrite, with no server or live state file.
@@ -407,4 +414,23 @@ test('raw logs expire after 24 hours and keep newest complete entries within the
   pruneLog(filename, now + 24 * 60 * 60 * 1000 + 1);
   assert.equal(fs.statSync(filename).size, 0);
   assert.equal(fs.existsSync(filename + '.tmp'), false);
+});
+
+test('buffered logs drain before ordinary process exit', {timeout: 5000}, async t => {
+  const filename = path.join(fixture(t), 'exit.log');
+  const script = "const {createLogWriter}=require(process.argv[1]); createLogWriter(process.argv[2])('final-entry');";
+  const child = spawn(process.execPath, ['-e', script, path.join(__dirname, 'filter.cjs'), filename],
+    {windowsHide: true, stdio: 'ignore'});
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 0);
+  assert.equal(fs.readFileSync(filename, 'utf8'), 'final-entry\n');
+});
+
+test('explicit log flush drains queued writes in order during an active append', async t => {
+  const filename = path.join(fixture(t), 'drain.log');
+  const write = createLogWriter(filename, {flushMs: 1000});
+  const expected = Array.from({length: 300}, (_, index) => 'entry-' + index);
+  for (const line of expected) write(line);
+  await write.flush();
+  assert.equal(fs.readFileSync(filename, 'utf8'), expected.join('\n') + '\n');
 });

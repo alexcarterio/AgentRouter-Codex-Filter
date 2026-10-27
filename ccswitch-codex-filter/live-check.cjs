@@ -124,11 +124,16 @@ async function main() {
     const after = await request(base.origin, ADMIN + '/health');
     const removed = after.stats.removedReasoningItems - before.stats.removedReasoningItems;
     const removedItemIds = (after.stats.removedItemIds || 0) - (before.stats.removedItemIds || 0);
+    const kept = (after.stats.reasoningKept || 0) - (before.stats.reasoningKept || 0);
+    // v11 lazy history: injected items are forwarded intact; the turn still
+    // succeeds when the upstream tolerates them (kept) or when the filter
+    // degrades to the stripped body after the cross-resource error (removed).
     const passed = exitCode === 0 && completed && output.trim() === 'FILTER_OK'
-      && (baseline || (injected >= 1 && removed >= injected && removedItemIds >= injectedItemIds));
+      && (baseline || (injected >= 1 && (removed >= injected || kept >= injected)));
     console.log(JSON.stringify({passed, baseline, client: 'installed Codex CLI', exitCode, completed, cliError,
       expectedOutputReceived: output.trim() === 'FILTER_OK', upstreamStatuses,
-      injectedReasoningItems: injected, removedReasoningItems: removed, injectedItemIds, removedItemIds}, null, 2));
+      injectedReasoningItems: injected, keptReasoningItems: kept, removedReasoningItems: removed,
+      injectedItemIds, removedItemIds}, null, 2));
     if (!passed) process.exitCode = 1;
   } finally {
     clearTimeout(timer);
