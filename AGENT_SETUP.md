@@ -22,7 +22,7 @@
 2. 修改已有配置或入口脚本前，建立本机回滚副本并核对内容/哈希。不要把本机回滚副本加入分享包，也不要使用别人电脑的运行目录或配置备份。
 3. 在 CC Switch 开启本地代理与 Codex 接管，使用接收者已经配置且选择的服务商。服务会只读发现当前用户 .cc-switch/cc-switch.db 中的端口；发现不到时回落到 15721，这不代表本机一定在用该端口，须核对实际监听。
 4. 过滤层仅接管顶层 model_provider 对应 [model_providers.NAME] 中的常规单行 base_url，并要求该地址与 CC Switch 入口匹配。没有支持的 provider 时会待命；不得为了让状态变绿而擅自把用户从官方默认账号切到一个自创服务商。若用户尚未决定或未配置 CC Switch 服务商，说明阻塞点，让用户完成必要选择或鉴权。
-5. 先查看状态并检查端口占用，避免多个实例管理同一份配置。现有服务不明时先识别归属，不直接结束未知进程。filterVersion 应为 11，historyMode 应为 lazy、bufferMode 应为 stream，retryPolicy 应列出合计 20 次、分类额度及 1800000 毫秒总期限；已运行旧版本时需要停止并重启才加载新代码。
+5. 先查看状态并检查端口占用，避免多个实例管理同一份配置。现有服务不明时先识别归属，不直接结束未知进程。filterVersion 应为 12，historyMode 应为 lazy、bufferMode 应为 stream，retryPolicy 应列出合计 20 次、分类额度及 1800000 毫秒总期限；已运行旧版本时需要停止并重启才加载新代码。
 
 默认情况无需改源码或脚本。如果配置、端口或数据库位于非默认位置，优先使用现有参数：--port、--config、--runtime、--upstream、--cc-db。选定参数在 start/status/logs/stop/ui 时保持一致；变更配置路径或端口前先按原参数停止。
 
@@ -59,7 +59,7 @@ pwsh -NoProfile -File .\ccswitch-filter.ps1 Test
 
 随后通过用户将来实际使用的“启动过滤服务.cmd”启动，使用“查看过滤状态.cmd”观察状态和实时日志。验证以下不同层次，分别报告结果：
 
-- 进程启动：running=true、filterVersion=11、historyMode=lazy、bufferMode=stream。
+- 进程启动：running=true、filterVersion=12、historyMode=lazy、bufferMode=stream。
 - 本机接入：state=filtering 且 ccSwitchReachable=true；核对目标文件中的 base_url 指向选定过滤端口。仅 running=true 不表示接入完成。
 - 客户端流量：配置接入后，需要完全退出并重开对应 Codex 客户端。不要擅自结束用户当前任务或应用；如本会话依赖该客户端，先报告本机安装结果，让用户在合适时机重启。
 - 重启后，在接收者正常获授权的请求中观察 filteredRequests、lastFilteredAt 及请求日志变化。累计数可能由其他客户端产生，不单独作为当前会话证据。没有这一步只能报告“本机安装已验证，当前客户端实际经过过滤尚未验证”。

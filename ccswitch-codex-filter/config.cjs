@@ -102,6 +102,7 @@ class ConfigRouter {
     this.log = log;
     this.state = 'waiting-for-ccswitch';
     this.routes = new Map();
+    this.mutating = false;
     if (fs.existsSync(backupPath)) {
       const backup = JSON.parse(fs.readFileSync(backupPath, 'utf8'));
       if (backup.configPath !== this.configPath || backup.filterOrigin !== this.filterOrigin || backup.version !== 1) {
@@ -118,6 +119,7 @@ class ConfigRouter {
     if (this.state !== state) { this.state = state; this.log('config-state', {state}); }
   }
   sync() {
+    if (this.mutating) return;
     if (!fs.existsSync(this.configPath)) { this.changeState('waiting-for-codex-config'); return; }
     const text = fs.readFileSync(this.configPath, 'utf8');
     const entry = providerBase(text);
@@ -140,12 +142,27 @@ class ConfigRouter {
     // Recovery info is saved before redirecting Codex; auth and full config are never copied.
     this.routes.set(entry.provider, {originalUrl: entry.url, originalLine: entry.line, filteredUrl, filteredLine});
     this.save();
-    if (fs.readFileSync(this.configPath, 'utf8') !== text) return;
-    atomicWrite(this.configPath, changed);
-    this.changeState('filtering');
-    this.log('config-attached', {provider: entry.provider});
+    this.mutating = true;
+    try {
+      // Re-read immediately before replacement so edits that happened while the
+      // route backup was written are detected instead of being overwritten.
+      const current = fs.readFileSync(this.configPath, 'utf8');
+      if (current !== text) {
+        this.log('config-conflict', {operation: 'attach', provider: entry.provider});
+        return;
+      }
+      atomicWrite(this.configPath, changed);
+      if (fs.readFileSync(this.configPath, 'utf8') !== changed) {
+        throw new Error('Config changed while attaching; retry configuration sync.');
+      }
+      this.changeState('filtering');
+      this.log('config-attached', {provider: entry.provider});
+    } finally {
+      this.mutating = false;
+    }
   }
   restore() {
+    if (this.mutating) return;
     if (!fs.existsSync(this.configPath)) return;
     let text = fs.readFileSync(this.configPath, 'utf8');
     const original = text;
@@ -157,8 +174,18 @@ class ConfigRouter {
       }
     }
     if (text !== original) {
-      if (fs.readFileSync(this.configPath, 'utf8') !== original) throw new Error('Config changed while restoring; retry Stop.');
-      atomicWrite(this.configPath, text);
+      this.mutating = true;
+      try {
+        if (fs.readFileSync(this.configPath, 'utf8') !== original) {
+          throw new Error('Config changed while restoring; retry Stop.');
+        }
+        atomicWrite(this.configPath, text);
+        if (fs.readFileSync(this.configPath, 'utf8') !== text) {
+          throw new Error('Config changed while restoring; retry Stop.');
+        }
+      } finally {
+        this.mutating = false;
+      }
     }
     this.changeState('restored');
   }

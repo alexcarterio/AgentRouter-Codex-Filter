@@ -163,6 +163,7 @@ async function serve(options) {
   // Exclusive creation serializes simultaneous starts; don't overwrite another instance.
   fs.writeFileSync(locations.state, JSON.stringify(record, null, 2), {flag: 'wx', mode: 0o600});
   let router, server, timer, logTimer, metricsTimer, stopping = false, lastError = null;
+  let shutdownStartedAt = null, forcedCloseAt = null;
   const writer = createLogWriter(locations.log);
   const log = (event, data = {}) => {
     const line = JSON.stringify({time: new Date().toISOString(), event, ...data});
@@ -176,13 +177,18 @@ async function serve(options) {
     // If restoration fails, keep serving rather than leaving Codex pointing at a dead port.
     router.restore();
     stopping = true;
+    shutdownStartedAt = new Date().toISOString();
     clearInterval(timer);
     clearInterval(logTimer);
     clearInterval(metricsTimer);
     flushMetrics();
     log('stopping');
     setTimeout(() => {
-      const force = setTimeout(() => server.closeAllConnections(), 10000);
+      const force = setTimeout(() => {
+        forcedCloseAt = new Date().toISOString();
+        log('shutdown-force-close', {drainMs: 10000});
+        server.closeAllConnections();
+      }, 10000);
       force.unref();
       server.close(async () => {
         clearTimeout(force);
@@ -199,6 +205,7 @@ async function serve(options) {
     server = makeProxy({getUpstream: () => upstream, token: record.token, onStop: shutdown, log, recorder,
       getState: () => ({instance, state: stopping ? 'stopping' : router.state, upstream,
         filterOrigin: options.filterOrigin, configPath: options.configPath, lastError,
+        shutdown: stopping ? {startedAt: shutdownStartedAt, forcedCloseAt} : null,
         filterVersion: FILTER_VERSION, historyMode: 'lazy', bufferMode: 'stream', dashboard: ADMIN + '/ui',
         logPolicy: {retentionHours: 24, maxBytes: LOG_MAX_BYTES, cleanupIntervalMs: 60000}})});
     await new Promise((resolve, reject) => {

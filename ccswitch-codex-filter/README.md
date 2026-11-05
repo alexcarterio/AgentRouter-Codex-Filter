@@ -1,14 +1,14 @@
-# CC Switch / Codex 历史推理与 ID 过滤脚本（v11）
+# CC Switch / Codex 历史推理与 ID 过滤脚本（v12）
 
 用于 Windows + Node.js 24+。无额外依赖，不需要 npm install。
 
 转发路径：Codex → 本机过滤层（默认 18181）→ CC Switch（自动发现监听端口）→ 上游。
 
-v11 相比 v10 的三点核心变化（v10 行为见文末"回退到 v10 模式"）：
+v12 在 v11 基础上增加兼容性、观测和发布门禁；v10/v11 行为见文末说明：
 
 1. **流式转发**：SSE 在上游首个 delta 到达时开始转发，不再等待完整响应。首个内容之前收到的可分类错误仍可隐形重试；内容交付后的错误与断流不再自动重放，交由客户端处理，已交付的输出无法撤回。
 2. **懒历史（lazy history）**：默认保留请求中的历史 reasoning（思维链）、密文与 ID，并保留 `include: reasoning.encrypted_content`，仍强制 `store:false`。未变更的请求按原始字节转发，跳过重新序列化。只有当上游报出跨资源归属错误（different Azure resource）时，才把该请求降级为 v10 的"移除 reasoning + 历史 ID"请求体重试。保留历史的实际质量、延迟和用量收益取决于客户端与上游，本次未作真实模型对照测量。
-3. **网页观测台**：内置实时仪表盘（`node filter.cjs ui`），每秒推送聚合数据：请求速率、首包/总耗时延迟、token 流量、错误分类、按类别的重试恢复占比、最近请求列表。当日聚合快照写入 `.runtime/metrics.json`，重启后恢复；明细与分钟曲线不持久化。
+3. **网页观测台**：内置实时仪表盘（`node filter.cjs ui`），每秒推送聚合数据：请求速率、首包/总耗时延迟、token 流量、错误分类、按类别的重试恢复占比、最近请求列表。当日聚合快照和最近 200 条必要明细写入 `.runtime/metrics.json`，重启后恢复；分钟曲线不持久化。
 
 ## 使用
 
@@ -25,7 +25,7 @@ node .\filter.cjs ui     # 打开网页观测台（浏览器自动打开，地�
 看到 status 的 state 为 filtering、ccSwitchReachable 为 true 后，重新启动 Codex 终端，或完全退出并重开使用该配置的 Codex 应用。
 running 为 true 仅表示后台服务运行，不代表当前窗口已接入。waiting-for-supported-provider / waiting-for-ccswitch 表示待命；正常使用官方默认配置时，不会强行切换到 CC Switch。
 
-更新脚本后，需要先 stop 再 start，重新加载代码。status 应显示 filterVersion: 11。
+更新脚本后，需要先 stop 再 start，重新加载代码。status 应显示 filterVersion: 12。
 桌面目录的三个 .cmd 入口（启动/停止/查看状态）不变，另新增"打开观测台.cmd"双击直达网页仪表盘。
 
 关闭过滤层：
@@ -40,9 +40,9 @@ node .\filter.cjs stop
 ## 网页观测台
 
 - 打开方式：`node filter.cjs ui`（自动打开默认浏览器），或双击上级目录"打开观测台.cmd"。地址形如 `http://127.0.0.1:18181/__codex_filter__/ui#<令牌>`，仅限本机访问；令牌用于数据接口鉴权，请勿外传该链接。
-- 数据经 SSE 每秒推送，页面无需刷新。断线自动重连；更换令牌后带 `#新令牌` 的地址优先于本地缓存。
+- 数据经 SSE 每秒推送，页面无需刷新。断线自动重连；更换令牌后带 `#新令牌` 的地址优先于本地缓存。V12 支持按结果和错误类别筛选最近请求，并可展开查看请求详情。
 - 内容：总览 KPI（总请求/成功/失败/取消/重试执行/**重试后获成功响应**/今日平均首包延迟/累计 tokens/思维链保留与移除/降级请求数）、每分钟请求速率与重试折线、每分钟首字与总耗时均值、每分钟 token 流量、错误分类与错误码排行、**按类别的重试效果表（调度/执行/恢复/耗尽/恢复占比/计划等待）**、首字与总耗时分布直方图、最近 200 条请求明细（耗时/首字/重试/错误/tokens）。正在处理的请求（等待上游/退避重试/流式输出中）单独展示。
-- 聚合数据不包含任何请求正文或密钥；token 用量来自响应中的 usage 字段。当日累计跨重启保留（metrics.json），按本机自然日重置。开始量归开始当天，完成量、用量与重试归各事件发生当天，跨午夜时完成量可大于当天开始量；活跃请求继续保留。分钟级曲线（最多 180 个有事件的分钟）与最近 200 条明细仅留内存。
+- 聚合数据不包含任何请求正文或密钥；token 用量来自响应中的 usage 字段。当日累计与最近 200 条必要明细跨重启保留（metrics.json），按本机自然日校验。开始量归开始当天，完成量、用量与重试归各事件发生当天，跨午夜时完成量可大于当天开始量；活跃请求重启后不会伪造成功。分钟级曲线最多保留 180 个有事件的分钟。
 - token 统计口径：`response.completed` 中的 `usage.input_tokens / output_tokens`，缓存命中单列（cached_tokens）。
 
 ## 实际过滤内容
@@ -51,7 +51,7 @@ node .\filter.cjs stop
 - **降级**：同一请求内，第一次遇到"不同 Azure 资源"归属错误（HTTP 400 或流内 response.failed）时，自动改用移除全部历史 reasoning、移除可移除历史 ID、剔除 include 密文项的保守请求体重试（即 v10 行为），后续重试沿用降级后的请求体。
 - 仍然明确拒绝（不转发、不静默丢弃）：`previous_response_id`、`conversation`、`item_reference`、compaction 及其他携带 encrypted_content 的非 reasoning 项。`/responses/compact` 一律 409。
 - 支持 JSON、gzip、deflate、br、zstd 请求；重新计算 Content-Length。
-- 上游返回的 SSE 与 HTTP 响应原样转发；仅流内错误事件在首个内容事件之前会被拦截并用于重试决策。
+- 上游返回的 SSE 与 HTTP 响应按事件边界转发；支持 LF、CRLF、CR 和分块事件。仅流内错误事件在首个内容事件之前会被拦截并用于重试决策；一旦输出 SSE 心跳，后续保持合法 SSE。
 
 ## 自动重试
 

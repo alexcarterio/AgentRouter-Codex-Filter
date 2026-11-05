@@ -239,8 +239,8 @@ module.exports = `<!doctype html>
     renderHist(el('histTtfb'), snapshot.ttfb, 'var(--accent)', 'ms');
     var merged = snapshot.total.counts.map(function (c, i) { return c + (snapshot.totalFailed.counts[i] || 0); });
     renderHist(el('histTotal'), {bounds: snapshot.total.bounds, counts: merged}, 'var(--violet)', 's');
-     latestRecent = snapshot.recent || [];
-     renderRequests(latestRecent);
+    latestRecent = snapshot.recent || [];
+    renderRequests(latestRecent);
   }
 
   function svgOpen(height) { return '<svg viewBox="0 0 600 ' + height + '" preserveAspectRatio="none" style="height:' + height + 'px">'; }
