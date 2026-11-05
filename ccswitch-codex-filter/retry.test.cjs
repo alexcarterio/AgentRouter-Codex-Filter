@@ -797,7 +797,7 @@ test('extended SSE rate-limit recovery stays invisible beyond five retries', asy
   assert.doesNotMatch(text, /discard_|event: error|rate_limit|response.failed/);
   assert.equal(attempts, 9);
   const state = await health();
-  assert.equal(state.filterVersion, 11);
+  assert.equal(state.filterVersion, 12);
   assert.equal(state.retryPolicy.maxRetries, 20);
   assert.equal(state.stats.rateLimitRetries, 8);
   assert.equal(state.stats.rateLimitRetryAccepted, 1);

@@ -6,7 +6,7 @@ const {timingSafeEqual} = require('node:crypto');
 const {StringDecoder} = require('node:string_decoder');
 const DASHBOARD_HTML = require('./dashboard.cjs');
 const SERVICE = 'ccswitch-codex-reasoning-filter-v1';
-const FILTER_VERSION = 11;
+const FILTER_VERSION = 12;
 const ADMIN = '/__codex_filter__';
 const LIMIT = 64 * 1024 * 1024;
 const ERROR_LIMIT = 64 * 1024;
@@ -182,13 +182,14 @@ function retryErrorClass(value) {
   if (!error || typeof error !== 'object') return null;
   if (nonRetryableBusiness(value)) return null;
   const message = typeof error.message === 'string' ? error.message : '';
-  const code = String(error.code || error.type || '');
+  const code = String(error.code || error.type || '').toLowerCase();
   if ((error.type === 'invalid_request_error' || value?.type === 'error' || value?.type === 'response.failed')
       && message.includes('The requested item was created under a different Azure OpenAI resource.')
       && message.includes('Use the same resource that created the item to access it.')) return 'resource';
-  if (/^(rate_limit_exceeded|rate_limit_error|too_many_requests)$/.test(code)
+  if (/^(429|rate_limit|rate_limit_exceeded|rate_limit_error|too_many_requests)$/.test(code)
       || /exceeded token rate limit/i.test(message)
       || (/rate limit exceeded/i.test(message) && /your requests|token|requests per minute/i.test(message))) return 'rateLimit';
+  if (/currently\s+experiencing\s+high\s+demand\b/i.test(message)) return 'transport';
   if (/^(stream_incomplete|stream_disconnected|upstream_idle_timeout|upstream_aborted)$/.test(code)
       || /stream closed before response\.completed|idle timeout waiting for SSE|stream disconnected before completion/i.test(message)) return 'transport';
   if (code === 'no_available_channel' || /无可用渠道|没有可用渠道|no available channels?/i.test(message)) return 'availability';
@@ -197,6 +198,11 @@ function retryErrorClass(value) {
   if (code === 'cc_switch_forward_failed') return 'transport';
   if (code === 'bad_response' || code === 'server_error') return 'transport';
   return null;
+}
+
+function sseBoundary(text) {
+  const match = /\r\n\r\n|\n\n|\r\r/.exec(text);
+  return match ? {index: match.index, length: match[0].length} : null;
 }
 
 function retryDelayMs(kind, index, headers, now = Date.now(), random = Math.random) {
@@ -539,7 +545,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             const chunks = [];
             let size = 0, pending = '', forwarded = false, completedSeen = false;
             const parseFrame = frame => {
-              const lines = frame.split(/\r?\n/);
+              const lines = frame.split(/\r\n|\r|\n/);
               const data = lines.filter(line => /^data:/.test(line))
                 .map(line => line.slice(5).replace(/^ /, '')).join('\n');
               if (!data || data.trim() === '[DONE]') return null;
@@ -621,10 +627,10 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
                 return;
               }
               pending += decoder.write(chunk);
-              let boundary, trigger = false;
-              while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+               let boundary, trigger = false;
+               while ((boundary = sseBoundary(pending))) {
                 const frame = pending.slice(0, boundary.index);
-                pending = pending.slice(boundary.index + boundary[0].length);
+                 pending = pending.slice(boundary.index + boundary.length);
                 const parsed = parseFrame(frame);
                 if (!parsed) continue;
                 const {event, value} = parsed;
@@ -671,10 +677,10 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             const tap = chunk => {
               if (completedSeen || stopped || !forwarded) return;
               if (chunk) pending += decoder.write(chunk);
-              let boundary;
-              while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+               let boundary;
+               while ((boundary = sseBoundary(pending))) {
                 const frame = pending.slice(0, boundary.index);
-                pending = pending.slice(boundary.index + boundary[0].length);
+                 pending = pending.slice(boundary.index + boundary.length);
                 const parsed = parseFrame(frame);
                 if (!parsed) continue;
                 const {event, value} = parsed;
@@ -698,10 +704,72 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             stream.once('end', ended);
             return;
           }
+          if (isResponses && response.statusCode >= 200 && response.statusCode < 300 && !isSse) {
+            const chunks = [];
+            let size = 0;
+            const forwardBuffered = buffer => {
+              if (stopped || res.destroyed) return;
+              settled = true;
+              everForwarded = true;
+              response.removeListener('error', attemptFailed);
+              response.removeAllListeners('aborted');
+              upstreamRequest.setTimeout(0);
+              outcome = 'success';
+              stopHeartbeat();
+              observe('forwarded', {requestId, ttfbMs: Date.now() - startedAt,
+                status: response.statusCode, streaming: false});
+              if (res.headersSent) {
+                const parsed = (() => { try { return JSON.parse(buffer.toString('utf8')); } catch { return null; } })();
+                res.end('event: response.completed\ndata: ' + JSON.stringify({
+                  type: 'response.completed', response: parsed || {output: []}
+                }) + '\n\n');
+                response.destroy();
+                return;
+              }
+              const headersOut = cleanHeaders(response.headers);
+              headersOut['content-length'] = String(buffer.length);
+              res.writeHead(response.statusCode, headersOut);
+              res.end(buffer);
+              response.destroy();
+            };
+            response.on('data', chunk => {
+              size += chunk.length;
+              if (size > limit) {
+                response.destroy(new Error('response_too_large'));
+                return;
+              }
+              chunks.push(chunk);
+            });
+            response.once('end', () => {
+              if (stopped || res.destroyed) return;
+              const bodyBuffer = Buffer.concat(chunks);
+              let value = null;
+              try { value = JSON.parse(decodeBody(bodyBuffer, response.headers['content-encoding'], limit).toString('utf8')); } catch {}
+              const detail = value?.error || value?.response?.error;
+              const decodedText = (() => { try { return decodeBody(bodyBuffer, response.headers['content-encoding'], limit).toString('utf8'); } catch { return ''; } })();
+              const textualTemporary = !value && /currently\s+experiencing\s+high\s+demand\b/i.test(decodedText);
+              const envelopeError = Boolean(detail) || value?.status === 'failed' || value?.type === 'error' || textualTemporary;
+              if (envelopeError) {
+                const kind = nonRetryableBusiness(value) ? null : (retryErrorClass(value) || (textualTemporary ? 'transport' : null));
+                const code = String(detail?.code || detail?.type || value?.type || 'other')
+                  .replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
+                requestLog('http-error', {status: response.statusCode, kind: kind || 'other', errorCode: kind ? errorLabel(kind) : code});
+                if (kind && schedule(kind, response, kind ? errorLabel(kind) : code)) {
+                  settled = true; discard(); return;
+                }
+                settled = true;
+                finishError(response, bodyBuffer);
+                return;
+              }
+              if (value?.usage || value?.response?.usage) {
+                observe('response-usage', {requestId, usage: value.usage || value.response.usage});
+              }
+              if (retries) accepted(response);
+              forwardBuffered(bodyBuffer);
+            });
+            return;
+          }
           if (!isResponses || response.statusCode < 400) {
-            if (isResponses && retries && response.statusCode >= 200 && response.statusCode < 300) {
-              accepted(response);
-            }
             forward();
             return;
           }
@@ -725,7 +793,7 @@ function makeProxy({getUpstream, token, onStop = () => {}, getState = () => ({})
             // 400 and explicit auth/quota/parameter errors keep their behavior.
             const albBadRequest = response.statusCode === 400 && isAlbBadRequestPage(
               value ? value.error?.code === 'cc_switch_upstream_error' ? value.error.message : '' : decoded);
-            const detected = retryErrorClass(value);
+            const detected = retryErrorClass(value) || (/currently\s+experiencing\s+high\s+demand\b/i.test(decoded) ? 'transport' : null);
             let kind = albBadRequest ? 'transport' : ((detected === 'resource' && response.statusCode === 400)
               || (detected === 'rateLimit' && [400, 429].includes(response.statusCode))
               || detected === 'transport'
