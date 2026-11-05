@@ -1,6 +1,6 @@
 {
   "name": "agentrouter-codex-filter",
-  "version": "12.0.0",
+  "version": "12.1.0",
   "private": true,
   "description": "Local Codex Responses compatibility filter with bounded retries",
   "license": "MIT",

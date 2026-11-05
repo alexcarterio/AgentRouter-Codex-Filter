@@ -161,7 +161,8 @@ test('daily rollover preserves in-flight requests and attributes new events to t
   assert.equal(restarted.hydrate(saved), true);
   assert.equal(restarted.snapshot().totals.success, 1);
   assert.equal(restarted.snapshot().totals.ttfbMs, 120500);
-  assert.equal(restarted.snapshot().recent.length, 0);
+  assert.equal(restarted.snapshot().recent.length, 2);
+  assert.equal(restarted.snapshot().recent.at(-1).outcome, 'success');
 });
 
 test('serialization rolls an idle day and first-packet averages survive minute retention and restart', t => {

@@ -134,6 +134,12 @@ module.exports = `<!doctype html>
   <div class="card">
     <h2>最近请求</h2>
     <div class="sub">最多保留 200 条，新请求在顶部；不含任何正文或密钥</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0">
+      <input id="reqSearch" placeholder="搜索请求编号或模型" style="flex:1;min-width:180px;padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)">
+      <select id="reqOutcome" style="padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)">
+        <option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option><option value="canceled">取消</option><option value="interrupted">中断</option>
+      </select>
+    </div>
     <div class="scroll"><table><thead><tr><th>#</th><th>开始时间</th><th>模型</th><th>结果</th><th class="num">耗时</th><th class="num">首包</th><th class="num">重试调度</th><th>错误</th><th class="num">tokens (入/出)</th></tr></thead>
     <tbody id="reqRows"></tbody></table></div>
   </div>
@@ -149,6 +155,7 @@ module.exports = `<!doctype html>
     no_available_channel: '无可用渠道', upstream_failed_without_details: 'response.failed 无详情',
     response_too_large: '响应超大小上限'};
   var token = '';
+  var latestRecent = [];
   try { token = localStorage.getItem('codexFilterToken') || ''; } catch (e) {}
   // A hash token always wins: restarting the service issues a new token, and a
   // hash-only navigation does not reload the page by itself.
@@ -232,7 +239,8 @@ module.exports = `<!doctype html>
     renderHist(el('histTtfb'), snapshot.ttfb, 'var(--accent)', 'ms');
     var merged = snapshot.total.counts.map(function (c, i) { return c + (snapshot.totalFailed.counts[i] || 0); });
     renderHist(el('histTotal'), {bounds: snapshot.total.bounds, counts: merged}, 'var(--violet)', 's');
-    renderRequests(snapshot.recent);
+     latestRecent = snapshot.recent || [];
+     renderRequests(latestRecent);
   }
 
   function svgOpen(height) { return '<svg viewBox="0 0 600 ' + height + '" preserveAspectRatio="none" style="height:' + height + 'px">'; }
@@ -390,11 +398,18 @@ module.exports = `<!doctype html>
   }
 
   function renderRequests(recent) {
-    var rows = recent.slice().reverse().map(function (r) {
+    var query = (el('reqSearch')?.value || '').trim().toLowerCase();
+    var outcome = el('reqOutcome')?.value || '';
+    var filtered = recent.filter(function (r) {
+      var matchesQuery = !query || String(r.id).toLowerCase().includes(query) || String(r.model || '').toLowerCase().includes(query);
+      return matchesQuery && (!outcome || r.outcome === outcome);
+    });
+    var rows = filtered.slice().reverse().map(function (r) {
       var badge = r.outcome ? ({success: ['成功', 'b-success'], failed: ['失败', 'b-failed'], canceled: ['取消', 'b-canceled']}[r.outcome] || [r.outcome, '']) : ['进行中', 'b-running'];
       var errors = r.codes.length ? r.codes.map(function (c) { return CODE_NOTE[c] || c; }).join('、') : (r.degraded ? '报错后已降级重试' : '');
       var retryNote = r.retries ? r.retries + '次(' + r.kinds.map(function (k) { return KIND_NAME[k] || k; }).join(',') + ')' : '-';
-      return '<tr><td class="mono">' + esc(r.id) + '</td><td>' + fmtClock(new Date(r.startTs).toISOString()) + '</td><td class="mono">' + esc(r.model || '-') + '</td>' +
+      var detail = '阶段: ' + (r.phase || (r.outcome ? 'done' : 'unknown')) + '\\n状态: ' + (r.status || '-') + '\\n错误: ' + (errors || '-') + '\\n重试: ' + retryNote;
+      return '<tr title="' + esc(detail) + '"><td class="mono">' + esc(r.id) + '</td><td>' + fmtClock(new Date(r.startTs).toISOString()) + '</td><td class="mono">' + esc(r.model || '-') + '</td>' +
         '<td><span class="badge ' + badge[1] + '">' + esc(badge[0]) + '</span></td>' +
         '<td class="num">' + fmtSec(r.durationMs) + '</td><td class="num">' + fmtSec(r.ttfbMs) + '</td>' +
         '<td class="num">' + esc(retryNote) + '</td><td class="hint" style="white-space:normal;min-width:120px">' + esc(errors) + '</td>' +
@@ -417,6 +432,11 @@ module.exports = `<!doctype html>
     };
   }
   connect();
+  ['reqSearch', 'reqOutcome'].forEach(function (id) {
+    var control = el(id);
+    if (control) control.addEventListener('input', function () { renderRequests(latestRecent); });
+    if (control) control.addEventListener('change', function () { renderRequests(latestRecent); });
+  });
 })();
 </script>
 </body>

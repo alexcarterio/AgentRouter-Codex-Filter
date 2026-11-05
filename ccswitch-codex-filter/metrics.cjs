@@ -256,7 +256,15 @@ class Recorder {
     this.rollDay();
     return {date: this.date, savedAt: new Date().toISOString(), totals: this.totals,
       errorsByCode: this.errorsByCode, errorsByKind: this.errorsByKind,
-      retry: this.retry, ttfb: this.ttfb, total: this.total, totalFailed: this.totalFailed};
+      retry: this.retry, ttfb: this.ttfb, total: this.total, totalFailed: this.totalFailed,
+      recent: this.recent.slice(-this.maxRecent).map(record => ({
+        id: record.id, model: record.model, streaming: record.streaming,
+        startTs: record.startTs, endTs: record.endTs, outcome: record.outcome,
+        durationMs: record.durationMs, ttfbMs: record.ttfbMs, status: record.status,
+        retries: record.retries, kinds: [...record.kinds], codes: [...record.codes],
+        tokens: record.tokens, requestBytes: record.requestBytes, degraded: record.degraded,
+        phase: record.phase
+      }))};
   }
 
   hydrate(saved) {
@@ -287,6 +295,17 @@ class Recorder {
     mergeHistogram(this.ttfb, saved.ttfb);
     mergeHistogram(this.total, saved.total);
     mergeHistogram(this.totalFailed, saved.totalFailed);
+    if (Array.isArray(saved.recent)) {
+      this.recent = saved.recent.slice(-this.maxRecent).map(record => ({
+        ...record,
+        kinds: Array.isArray(record.kinds) ? [...record.kinds] : [],
+        codes: Array.isArray(record.codes) ? [...record.codes] : [],
+        phase: record.outcome ? 'done' : 'interrupted',
+        outcome: record.outcome || 'interrupted',
+        endTs: record.endTs || record.startTs || Date.now(),
+        durationMs: Number.isFinite(record.durationMs) ? record.durationMs : null
+      }));
+    }
     this.version++;
     return true;
   }
